@@ -16,9 +16,14 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/window_capacity.hpp"
+#include <chrono>
 
 #include "parity_device.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -54,11 +59,84 @@ void reference(const std::vector<uint16_t>& x, const std::vector<uint16_t>& w, l
 
 }  // namespace
 
+int xmx_parity() {
+    namespace k = strata::kernels;
+    strata::parity::Device dev;
+    void* cs = strata::parity::stream();
+    int bad = 0;
+    constexpr int ni = 2560;
+    constexpr double kRelTolerance = 3e-5, kAbsTolerance = 2e-4;
+    for (int no : {48, 128, 512, 2560}) {
+        std::mt19937 rng(353);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> x((size_t) ni * k::kVerifyMaxT);
+        std::vector<uint16_t> w((size_t) ni * no);
+        for (float& v : x) v = nd(rng);
+        for (uint16_t& v : w) v = bf16_from_f32(nd(rng) * .05f);
+        float* dx = dev.upload(x);
+        uint16_t* dw = dev.upload(w);
+        float* dy = dev.alloc<float>((size_t) no * k::kVerifyMaxT);
+        uint16_t* scratch = dev.alloc<uint16_t>(2 * x.size());
+        // Fallback eligibility must submit nothing; nulls, solo rows, oversized rows and bad strides.
+        if (k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, 1, scratch, cs) ||
+            k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, k::kVerifyMaxT + 1, scratch, cs) ||
+            k::bf16_gemm_fp32_xmx(dx, ni - 1, dw, dy, no, ni, no, 8, scratch, cs) ||
+            k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, 8, nullptr, cs)) ++bad;
+        for (int rows : {2, 7, 8, 16, 17, 24, 31, 32}) {
+            if (!k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, rows, scratch, cs)) {
+                std::fprintf(stderr, "bf16x2 XMX unavailable: rows=%d output=%d (no execution proof)\n", rows, no);
+                return 77;
+            }
+            std::vector<float> got((size_t) rows * no), want(got.size()), again(got.size());
+            strata::parity::copy_out(got.data(), dy, got.size());
+            for (int t = 0; t < rows; ++t) for (int o = 0; o < no; ++o) {
+                double sum = 0;
+                for (int i = 0; i < ni; ++i) sum += (double) x[(size_t) t * ni + i] * f32_from_bf16(w[(size_t) o * ni + i]);
+                want[(size_t) t * no + o] = (float) sum;
+            }
+            double max_scaled = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                const double e = std::fabs((double) got[i] - want[i]) / (1 + std::fabs(want[i]));
+                if (!std::isfinite(e)) ++bad;
+                max_scaled = std::max(max_scaled, e);
+            }
+            const double rel = rel_l1(want, got);
+            if (!(rel <= kRelTolerance && max_scaled <= kAbsTolerance)) ++bad;
+            k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, rows, scratch, cs);
+            strata::parity::copy_out(again.data(), dy, again.size());
+            if (std::memcmp(got.data(), again.data(), got.size() * sizeof(float)) != 0) ++bad;
+            if (no == 48) {
+                std::vector<float> dt(no, .125f), sa(no, -.75f), activated(got.size()), beta(got.size());
+                float* db = dev.upload(got);
+                k::gdn_ab_activate(dy, db, dev.upload(dt), dev.upload(sa), no, rows, cs);
+                strata::parity::copy_out(activated.data(), dy, activated.size());
+                strata::parity::copy_out(beta.data(), db, beta.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    const float v = got[i] + dt[i % no];
+                    const float a = (v > 20.f ? v : std::log1p(std::exp(v))) * sa[i % no];
+                    const float b = 1.f / (1.f + std::exp(-got[i]));
+                    if (std::fabs(activated[i] - a) > 1e-5f || std::fabs(beta[i] - b) > 1e-6f) ++bad;
+                }
+            }
+            constexpr int kTrials = 5;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int j = 0; j < kTrials; ++j) k::bf16_gemm_fp32_xmx(dx, ni, dw, dy, no, ni, no, rows, scratch, cs);
+            strata::parity::sync();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() / kTrials;
+            std::printf("bf16x2 executed rows=%d K=%d N=%d rel_l1=%.3g max_scaled=%.3g repeat=bitwise time=%.3f ms\n",
+                        rows, ni, no, rel, max_scaled, ms);
+        }
+    }
+    std::printf("bf16x2: %d failures\n", bad);
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--xmx") return xmx_parity();
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: bf16_gemv_parity [--selftest]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: bf16_gemv_parity [--selftest|--xmx]\n"); return 2; }
     }
     int bad = 0;
 

@@ -56,9 +56,36 @@ bool stream_idle(Stream s);
 bool device_sync();
 
 void* alloc_device(size_t bytes);
-void* alloc_host(size_t bytes);
+/// `pool`: the name the bytes are counted under (host_pin_report); a string with static storage.
+void* alloc_host(size_t bytes, const char* pool = "other");
 template <class T> bool alloc_device(T** p, size_t bytes) { *p = static_cast<T*>(alloc_device(bytes)); return *p; }
-template <class T> bool alloc_host(T** p, size_t bytes) { *p = static_cast<T*>(alloc_host(bytes)); return *p; }
+template <class T> bool alloc_host(T** p, size_t bytes, const char* pool = "other") {
+    *p = static_cast<T*>(alloc_host(bytes, pool));
+    return *p;
+}
+
+/// The host-pin ledger.  Host USM is pinned by the driver (on xe: GTT pages), outside the RAM the OS can reclaim and
+/// outside a container's memory limit (odie 2026-10-23: 85 GiB pinned under a docker --memory 80g that counted 19
+/// GiB, and the box stopped answering).  Every host USM block is counted under its pool; STRATA_HOST_PIN_MAX_GIB caps
+/// the total, and an allocation past the cap is refused as a driver refusal is (last_error says so), so each caller's
+/// fallback applies.  kHostPinMaxGibDefault (0): no cap, as before the ledger.
+constexpr double kHostPinMaxGibDefault = 0;
+/// The cap in bytes (0: none): STRATA_HOST_PIN_MAX_GIB, read once, or host_pin_set_max_bytes.
+uint64_t host_pin_max_bytes();
+void host_pin_set_max_bytes(uint64_t bytes);
+/// Bytes counted now: pinned blocks plus reservations not yet committed.
+uint64_t host_pinned_bytes();
+/// Reserve `bytes` for `pool` before pinning them; false (last_error says why) when the cap would be passed.
+bool host_pin_reserve(size_t bytes, const char* pool);
+/// A reservation now pinned at `p` / given back unpinned.
+void host_pin_commit(const void* p, size_t bytes, const char* pool);
+void host_pin_cancel(size_t bytes);
+/// Forgets the block at `p` (anything not committed: a no-op); its bytes.
+size_t host_pin_release(const void* p);
+/// A note shown beside `pool` in the report (what it holds), replacing the last one.
+void host_pin_detail(const char* pool, const std::string& text);
+/// One line: the total, the cap, then every pool largest first as "name N x size (total)" and its note.
+std::string host_pin_report();
 /// Frees device or host USM after draining the runtime's queues (null is a no-op).
 void free(const void* p);
 /// The device address of host USM (itself); false for memory that is not host USM.
@@ -142,6 +169,8 @@ bool event_sync(const Event* e);
 bool stream_wait_event(Stream s, const Event* e);
 /// Milliseconds between two completed events.
 bool event_elapsed_ms(float* ms, const Event* from, const Event* to);
+/// A completed timing event's device timestamp (ns, the device timer's own epoch: compare only with this device's).
+bool event_time_ns(const Event* e, uint64_t* ns);
 
 /// Starts recording the commands submitted to `s`; they are not executed.
 bool begin_capture(Stream s);

@@ -32,6 +32,12 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // homelab shared prefix (STRATA_SHARED_PREFIX): `origin` names the read that wrote this state (0: unknown, e.g. a
+    // checkpoint read from a session file); copies keep it, so two checkpoints of one origin are the same bytes and a
+    // session whose K/V below it is a byte copy of that read's may share one of them.  `shared`: the prefix starts at
+    // least one other prompt seen, so batch slots keep it for other conversations to start from.  Run-time marks only.
+    uint64_t origin = 0;
+    bool shared = false;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;

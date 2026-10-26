@@ -17,10 +17,14 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
 #include "strata/kernels/device_arch_tag.hpp"
+#include "param_table.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -135,8 +139,34 @@ inline float dotn(const float* k, const float* q) {
     return s;
 }
 
-template <int HD, int G, int KV_MODE>
-sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
+// Query z's pools: the one state's (every query of a sequence), or row z's table entry (a batch window's slots).
+template <int KV_MODE>
+inline QsaAttnPools pools_of(const QsaAttnPools& p, size_t) { return p; }
+template <int KV_MODE>
+inline QsaAttnPools pools_of(const QsaAttnSlots& t, size_t z) {
+    QsaAttnPools p;
+    p.page_table = t.page_table[z];
+    if constexpr (KV_MODE == 0) {
+        p.k_pool = static_cast<const uint16_t*>(t.k[z]);
+        p.v_pool = static_cast<const uint16_t*>(t.v[z]);
+    } else if constexpr (KV_MODE == 1) {
+        p.k_q = static_cast<const int8_t*>(t.k[z]);
+        p.v_q = static_cast<const int8_t*>(t.v[z]);
+        p.k_scale = t.k_scale[z];
+        p.v_scale = t.v_scale[z];
+    } else if constexpr (KV_MODE == 2) {
+        p.k_q4 = static_cast<const uint8_t*>(t.k[z]);
+        p.v_q4 = static_cast<const uint8_t*>(t.v[z]);
+    } else {
+        p.k_q = static_cast<const int8_t*>(t.k[z]);
+        p.k_scale = t.k_scale[z];
+        p.v_q4 = static_cast<const uint8_t*>(t.v[z]);
+    }
+    return p;
+}
+
+template <int HD, int G, int KV_MODE, class Src>
+sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const Src src, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_chunks, size_t n_q, int cap,
                          long long scratch_stride) {
@@ -154,10 +184,11 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
         sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * GP / 4), hd);  // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
         hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_chunks * THREADS}, {1, 1, THREADS}),
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                        xe::fits("qsa_decode_attn chunk", [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const auto grp = it.get_group();
             const sycl::sub_group sg = it.get_sub_group();
             const size_t z = it.get_group(0);
+            const QsaAttnPools p = pools_of<KV_MODE>(src, z);
             // batched form: query z, with its own q row, selection, step and scratch
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
@@ -283,7 +314,488 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 fold(c, load_v1<HD, KV_MODE>(p, srow[c], t));
             }
             for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
-        });
+        }));
+    });
+}
+
+// ---- STRATA_QSA_ATTN_LANES=1 (homelab): launch_chunk's chunk in 16-lane sub-groups with one CELL a lane in the score
+// pass, the same bits.  Measured on the B70 at 16 rows (batch_window_ubench, int8): launch_chunk takes 270 us for 35 MB
+// of K/V (~3x the 456 GB/s floor).  Its score pass splits a cell's 256 dimensions over 32 lanes, so every lane reads
+// its 8 dims x 12 heads of the query out of local memory for every cell pair (384 KB of local reads a 64-cell chunk
+// against 67 KB of K/V) and reduces 12 heads across the lanes; its value pass reads the 12 weights of every cell out of
+// local memory in every work-item (786 KB a chunk).  Here a lane holds its cell's 12 scores in registers, takes the
+// query as a 16-wide window a load and broadcasts each dimension from the lane that holds it (a register region, no
+// local memory), and builds each score with the summation tree reduce12 performs across lanes (leaf B = dims
+// [8B, 8B+8) summed left to right; then pairs B ^ 16, ^ 8, ^ 4, ^ 2, ^ 1), so every score is launch_chunk's bit for
+// bit.  The value pass gives sub-group w the dims [64w, 64w+64) (4 a lane, one 64-byte line a cell) and broadcasts
+// the weights of 16 cells from the lanes that computed them; each accumulator folds the cells in ascending order with
+// launch_chunk's fma, so the partials, and so the merged output, are its bits.  The chunks (CHUNK cells), the scratch
+// layout and the merge are launch_chunk's.  FP16 and INT8 K/V (the Q4_0 V of modes 2 and 3 keeps launch_chunk);
+// head_dim 256 only.
+constexpr int kLanesSg = 16;
+constexpr int kLanesVPrefetch = 8;   // value-pass cells whose loads are issued before their folds
+
+// K row `row`, dims [d0, d0+8): loadn's values (KV modes 0 and 1) in one vector load; `ks` the row's four scales.
+template <int KV_MODE>
+inline void lanes_k8(const QsaAttnPools& p, long long row, int d0, const float (&ks)[4], float (&out)[8]) {
+    if constexpr (KV_MODE == 0) {
+        const sycl::vec<uint16_t, 8> v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.k_pool + row * 256 + d0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = h2f(v[j]);
+    } else {
+        const sycl::vec<int8_t, 8> v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + row * 256 + d0);
+        const float sc = ks[d0 / KV_Q8_GROUP];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = (float) v[j] * sc;
+    }
+}
+
+// V row `row`, dims [d0, d0+4): the raw codes (one load), then load_v1's values given the row's scale for d0's group.
+template <int KV_MODE>
+using LanesRaw = std::conditional_t<KV_MODE == 0, sycl::vec<uint16_t, 4>, sycl::vec<int8_t, 4>>;
+template <int KV_MODE>
+inline LanesRaw<KV_MODE> lanes_v4_raw(const QsaAttnPools& p, long long row, int d0) {
+    if constexpr (KV_MODE == 0) return *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(p.v_pool + row * 256 + d0);
+    else return *reinterpret_cast<const sycl::vec<int8_t, 4>*>(p.v_q + row * 256 + d0);
+}
+template <int KV_MODE>
+inline float lanes_v_scale(const QsaAttnPools& p, long long row, int d0) {
+    if constexpr (KV_MODE == 0) return 1.0f;
+    else return h2f(p.v_scale[row * (256 / KV_Q8_GROUP) + d0 / KV_Q8_GROUP]);
+}
+template <int KV_MODE>
+inline float lanes_v1(const LanesRaw<KV_MODE>& raw, int k, float sc) {
+    if constexpr (KV_MODE == 0) return h2f(raw[k]);
+    else return (float) raw[k] * sc;
+}
+
+// The score tree of HG heads: leaf B is dotn<8> over dims [8B, 8B+8); level L pairs B with B + 2^L (L = 4 first, as
+// reduce12's xor 16), so tree<0>(0) is the sum reduce12 leaves in every lane.
+template <int G, int L, class Leaf>
+inline void lanes_tree(int b, float (&out)[G], const Leaf& leaf) {
+    if constexpr (L == 5) {
+        leaf(b, out);
+    } else {
+        float lo[G], hi[G];
+        lanes_tree<G, L + 1>(b, lo, leaf);
+        lanes_tree<G, L + 1>(b + (1 << L), hi, leaf);
+#pragma unroll
+        for (int h = 0; h < G; ++h) out[h] = lo[h] + hi[h];
+    }
+}
+
+template <int HD, int G, int KV_MODE, class Src>
+sycl::event launch_chunk_lanes(sycl::queue& queue, const float* q_all, const Src src, const int32_t* ids_all,
+                               const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
+                               float* part_m_all, float* part_l_all, int n_chunks, size_t n_q, int cap,
+                               long long scratch_stride) {
+    static_assert(HD == 256 && (KV_MODE == 0 || KV_MODE == 1), "the lanes form: head_dim 256, FP16 or INT8 K/V");
+    static_assert(G >= 1 && G <= 16, "launch_chunk's head bound");
+    constexpr int SG = kLanesSg;
+    constexpr int NSG = CHUNK / SG;          // 4 sub-groups: a cell a lane in the score pass
+    constexpr int THREADS = CHUNK;
+    constexpr int VD = HD / (NSG * SG);      // 4 dims a lane in the value pass
+    constexpr int GP = (G + 3) / 4 * 4;
+    static_assert(VD == 4 && HD / NSG == KV_Q8_GROUP, "a value-pass sub-group spans one scale group");
+    const bool dense = ids_all == nullptr;
+    return queue.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<sycl::float4, 1> sp(sycl::range<1>(CHUNK * GP / 4), hd);   // scores, then weights, cell-major
+        sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);
+        hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_chunks * THREADS}, {1, 1, THREADS}),
+                        xe::fits("qsa_decode_attn lanes", [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kLanesSg)]] {
+            const auto grp = it.get_group();
+            const sycl::sub_group sg = it.get_sub_group();
+            const size_t z = it.get_group(0);
+            const QsaAttnPools p = pools_of<KV_MODE>(src, z);
+            const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
+            const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
+            const int32_t* step = step_all + z * kStepCount;
+            float* part_acc = part_acc_all + z * (size_t) scratch_stride;
+            float* part_m = part_m_all + z * (size_t) scratch_stride;
+            float* part_l = part_l_all + z * (size_t) scratch_stride;
+            const int n_ids = dense ? step[kStepNKv] : step[kStepWidth];
+            const int chunk = (int) it.get_group(2), kvh = (int) it.get_group(1);
+            const int t = (int) it.get_local_id(2);
+            const int lane = (int) sg.get_local_linear_id(), w = (int) sg.get_group_linear_id();
+            const int c0 = chunk * CHUNK;
+            const int n_here = sycl::min(CHUNK, n_ids - c0);
+            const int slot = kvh * n_chunks + chunk;
+            if (n_here <= 0) {                                    // uniform across the group
+                if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+                return;
+            }
+            float* spf = reinterpret_cast<float*>(&sp[0]);
+            // ---- scores: lane = cell c of the chunk
+            const int c = w * SG + lane;
+            long long r = -1;
+            if (c < n_here) {
+                const int cell = dense ? c0 + c : ids[c0 + c];
+                const long long page = (long long) p.page_table[cell / page_size];
+                if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);   // else masked
+            }
+            srow[c] = r;
+            const long long rr = r >= 0 ? r : 0;   // a masked lane reads row 0 and drops its scores
+            float ks[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            if constexpr (KV_MODE == 1) {
+#pragma unroll
+                for (int g = 0; g < 4; ++g) ks[g] = h2f(p.k_scale[rr * (HD / KV_Q8_GROUP) + g]);
+            }
+            const float* qk = q + (size_t) (kvh * G) * HD;
+            // HG heads a pass (the K row read again from the cache for the next ones): G heads at once hold G x 4
+            // pending tree sums and spill.  Lane l loads dim 8B + (l & 7) of the query for leaf B, broadcast from lanes
+            // 0..7; a window of its own a leaf, so no load is shared between leaves far apart in the tree.
+            constexpr int HG = G / 2;
+            static_assert(G % 2 == 0, "two passes of G / 2 heads");
+#pragma unroll 1
+            for (int h0 = 0; h0 < G; h0 += HG) {
+                const auto leaf = [&](int b, float (&out)[HG]) {
+                    float kk[8];
+                    lanes_k8<KV_MODE>(p, rr, b * 8, ks, kk);
+#pragma unroll
+                    for (int h = 0; h < HG; ++h) {
+                        const float qw = qk[(h0 + h) * HD + b * 8 + (lane & 7)];
+                        float s = kk[0] * sycl::select_from_group(sg, qw, 0);
+#pragma unroll
+                        for (int e = 1; e < 8; ++e) s = s + kk[e] * sycl::select_from_group(sg, qw, e);
+                        out[h] = s;
+                    }
+                };
+                // the tree's top two levels as a loop over its four subtrees of level 2 (leaves B = base + 4 j, the
+                // K row's four 64-byte lines each), so the compiler cannot hoist all 32 leaves' loads and spill them:
+                // e = (T(0) + T(2)) + (T(1) + T(3)), T(base) = lanes_tree<HG, 2>(base)
+                float sc[HG], hi[HG];
+#pragma unroll 1
+                for (int k = 0; k < 4; ++k) {
+                    float t[HG];
+                    lanes_tree<HG, 2>(2 * (k & 1) + (k >> 1), t, leaf);
+#pragma unroll
+                    for (int h = 0; h < HG; ++h) {
+                        if (k == 0) sc[h] = t[h];
+                        else if (k == 1) sc[h] = sc[h] + t[h];
+                        else if (k == 2) hi[h] = t[h];
+                        else sc[h] = sc[h] + (hi[h] + t[h]);
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < HG; ++h) spf[c * GP + h0 + h] = r >= 0 ? sc[h] * scale : -FLT_MAX;
+            }
+            sycl::group_barrier(grp);
+            // ---- per-head chunk max and exp-sum (launch_chunk's: its lane l held cells l and l + 32)
+            for (int h = w; h < G; h += NSG) {
+                float a[4], e[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) a[k] = spf[(lane + SG * k) * GP + h];
+                float m = sycl::fmax(sycl::fmax(a[0], a[2]), sycl::fmax(a[1], a[3]));
+                for (int o = SG / 2; o > 0; o >>= 1) m = sycl::fmax(m, sycl::permute_group_by_xor(sg, m, o));
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const int cc = lane + SG * k;
+                    e[k] = (cc < n_here && srow[cc] >= 0) ? sycl::exp(a[k] - m) : 0.0f;
+                    spf[cc * GP + h] = e[k];
+                }
+                // warp_sum's tree: its lane l held e[l] + e[l + 32]; the xor-16 pair is this lane's two
+                float l = (e[0] + e[2]) + (e[1] + e[3]);
+                for (int o = SG / 2; o > 0; o >>= 1) l += sycl::permute_group_by_xor(sg, l, o);
+                if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+            }
+            sycl::group_barrier(grp);
+            // ---- values: sub-group w owns dims [64 w, 64 w + 64), this lane d0 .. d0 + 3, every cell in order
+            const int d0 = w * KV_Q8_GROUP + lane * VD;
+            float acc[G][VD];
+#pragma unroll
+            for (int h = 0; h < G; ++h)
+#pragma unroll
+                for (int k = 0; k < VD; ++k) acc[h][k] = 0.0f;
+            for (int cb = 0; cb < CHUNK; cb += SG) {
+                const long long rl = srow[cb + lane];
+                const long long rlc = rl >= 0 ? rl : 0;
+                const float svl = lanes_v_scale<KV_MODE>(p, rlc, d0);
+                float pl[GP];
+#pragma unroll
+                for (int g4 = 0; g4 < GP / 4; ++g4) {
+                    const sycl::float4 v = sp[(size_t) (cb + lane) * (GP / 4) + g4];
+                    pl[4 * g4] = v.x(); pl[4 * g4 + 1] = v.y(); pl[4 * g4 + 2] = v.z(); pl[4 * g4 + 3] = v.w();
+                }
+#pragma unroll
+                for (int i0 = 0; i0 < SG; i0 += kLanesVPrefetch) {
+                    LanesRaw<KV_MODE> raw[kLanesVPrefetch];   // these cells' loads issued together
+#pragma unroll
+                    for (int i = 0; i < kLanesVPrefetch; ++i)
+                        raw[i] = lanes_v4_raw<KV_MODE>(p, sycl::select_from_group(sg, rlc, i0 + i), d0);
+#pragma unroll
+                    for (int i = 0; i < kLanesVPrefetch; ++i) {
+                        if (sycl::select_from_group(sg, rl, i0 + i) < 0) continue;   // masked or past n_here: weight 0
+                        const float svi = sycl::select_from_group(sg, svl, i0 + i);
+                        float v[VD];
+#pragma unroll
+                        for (int k = 0; k < VD; ++k) v[k] = lanes_v1<KV_MODE>(raw[i], k, svi);
+#pragma unroll
+                        for (int h = 0; h < G; ++h) {
+                            const float wt = sycl::select_from_group(sg, pl[h], i0 + i);
+#pragma unroll
+                            for (int k = 0; k < VD; ++k) acc[h][k] = sycl::fma(wt, v[k], acc[h][k]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h)
+                *reinterpret_cast<sycl::float4*>(part_acc + ((size_t) slot * G + h) * HD + d0) =
+                    sycl::float4(acc[h][0], acc[h][1], acc[h][2], acc[h][3]);
+        }));
+    });
+}
+
+// STRATA_QSA_ATTN_LANES (default off); qsa_decode_attn_set_lanes overrides it for tests (-1: the setting again).
+constexpr bool kQsaAttnLanesDefault = false;
+int g_lanes_forced = -1;
+bool lanes_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_QSA_ATTN_LANES");
+        return v == nullptr ? kQsaAttnLanesDefault : std::strtol(v, nullptr, 10) != 0;
+    }();
+    return g_lanes_forced >= 0 ? g_lanes_forced != 0 : env;
+}
+
+// ---- STRATA_QSA_ATTN_FAST=1 (homelab): the lanes form without launch_chunk's bits.  (1) A score is one fma chain a
+// scale group (INT8: the codes times the query, then the group's sum times its scale once; launch_chunk scales every
+// code and sums in reduce12's tree, so 2 ops a dimension become 1).  (2) A work-group walks `span` chunks of CHUNK
+// cells in order with an online softmax (a running max and sum a head, the accumulators rescaled when the max moves),
+// so the partials (12 x 256 floats a chunk, written and read back by the merge) shrink span times: at 16 rows of the
+// full selection they are ~13 MB each way against 35 MB of K/V.  `span` keeps the grid at about kFastTargetGroups
+// work-groups (STRATA_QSA_ATTN_FAST_GROUPS).  The merge is launch_merge over the work-groups.  Matches the default to
+// float rounding (qsa_attn_lanes_parity: 1e-5 of the output's scale, and FP64).
+constexpr bool kQsaAttnFastDefault = false;
+constexpr int kFastTargetGroups = 512;   // one wave of work-groups (the B70: 32 Xe cores x 16 of 64 work-items)
+constexpr int kFastSpanMax = 8;
+int g_fast_forced = -1, g_fast_span_forced = 0;
+bool fast_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_QSA_ATTN_FAST");
+        return v == nullptr ? kQsaAttnFastDefault : std::strtol(v, nullptr, 10) != 0;
+    }();
+    return g_fast_forced >= 0 ? g_fast_forced != 0 : env;
+}
+int fast_span(size_t n_q, int n_kv_heads, int n_chunks) {
+    static const long target = [] {
+        const char* v = std::getenv("STRATA_QSA_ATTN_FAST_GROUPS");
+        const long t = v == nullptr ? 0 : std::strtol(v, nullptr, 10);
+        return t > 0 ? t : (long) kFastTargetGroups;
+    }();
+    if (g_fast_span_forced > 0) return std::min(g_fast_span_forced, n_chunks);
+    // the smallest span whose grid fits `target` work-groups (one wave of the card: a grid a little past it runs a
+    // second, nearly empty wave; B70 16 rows x 33 chunks, slots: span 1 226.5 us, 2 234.7, 3 181.6, 4 201.4, 6 262.3)
+    const int top = std::min(kFastSpanMax, n_chunks);
+    int span = 1;
+    while (span < top && (long) n_q * n_kv_heads * ((n_chunks + span - 1) / span) > target) ++span;
+    return span;
+}
+
+// STRATA_QSA_ATTN_LANES_MIN_ROWS: the lanes and fast forms only for calls of at least this many rows (B70, all3
+// image, batch_window_ubench stage totals 1/2/4/8/16 rows: lanes +0.69/+0.74/-0.05/-0.19/-0.20 ms, fast +0.48/+0.43/
+// -0.01/-0.01/-0.21: a cell a lane loses at a few work-groups, where each lane's row arrives in serial round trips).
+// A forced setting (the test hooks) takes every call.
+constexpr int kLanesMinRows = 4;
+bool lanes_rows_ok(size_t n_q) {
+    static const long min_rows = [] {
+        const char* v = std::getenv("STRATA_QSA_ATTN_LANES_MIN_ROWS");
+        return v == nullptr ? (long) kLanesMinRows : std::strtol(v, nullptr, 10);
+    }();
+    return g_lanes_forced >= 0 || g_fast_forced >= 0 || (long) n_q >= min_rows;
+}
+
+// K row `row`, dims [d0, d0+8) as floats before the scale (INT8: the codes; FP16: the values)
+template <int KV_MODE>
+inline void fast_k8(const QsaAttnPools& p, long long row, int d0, float (&out)[8]) {
+    if constexpr (KV_MODE == 0) {
+        const sycl::vec<uint16_t, 8> v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.k_pool + row * 256 + d0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = h2f(v[j]);
+    } else {
+        const sycl::vec<int8_t, 8> v = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + row * 256 + d0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = (float) v[j];
+    }
+}
+
+template <int HD, int G, int KV_MODE, class Src>
+sycl::event launch_chunk_fast(sycl::queue& queue, const float* q_all, const Src src, const int32_t* ids_all,
+                              const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
+                              float* part_m_all, float* part_l_all, int n_groups, int span, size_t n_q, int cap,
+                              long long scratch_stride) {
+    static_assert(HD == 256 && (KV_MODE == 0 || KV_MODE == 1), "the fast form: head_dim 256, FP16 or INT8 K/V");
+    constexpr int SG = kLanesSg;
+    constexpr int NSG = CHUNK / SG;
+    constexpr int THREADS = CHUNK;
+    constexpr int VD = HD / (NSG * SG);
+    constexpr int GP = (G + 3) / 4 * 4;
+    constexpr int HJ = (G + NSG - 1) / NSG;   // heads a sub-group keeps the running max and sum of
+    constexpr int HG = G / 2;
+    static_assert(VD == 4 && HD / NSG == KV_Q8_GROUP && G % 2 == 0, "the lanes form's geometry");
+    const bool dense = ids_all == nullptr;
+    return queue.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<sycl::float4, 1> sp(sycl::range<1>(CHUNK * GP / 4), hd);
+        sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);
+        sycl::local_accessor<float, 1> salpha(sycl::range<1>(GP), hd);   // this chunk's rescale of each head
+        hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_groups * THREADS}, {1, 1, THREADS}),
+                        xe::fits("qsa_decode_attn fast", [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kLanesSg)]] {
+            const auto grp = it.get_group();
+            const sycl::sub_group sg = it.get_sub_group();
+            const size_t z = it.get_group(0);
+            const QsaAttnPools p = pools_of<KV_MODE>(src, z);
+            const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
+            const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
+            const int32_t* step = step_all + z * kStepCount;
+            float* part_acc = part_acc_all + z * (size_t) scratch_stride;
+            float* part_m = part_m_all + z * (size_t) scratch_stride;
+            float* part_l = part_l_all + z * (size_t) scratch_stride;
+            const int n_ids = dense ? step[kStepNKv] : step[kStepWidth];
+            const int gi = (int) it.get_group(2), kvh = (int) it.get_group(1);
+            const int t = (int) it.get_local_id(2);
+            const int lane = (int) sg.get_local_linear_id(), w = (int) sg.get_group_linear_id();
+            const int slot = kvh * n_groups + gi;
+            const int n_blk = sycl::min(span, (n_ids + CHUNK - 1) / CHUNK - gi * span);
+            if (n_blk <= 0) {                                     // uniform across the group
+                if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+                return;
+            }
+            float* spf = reinterpret_cast<float*>(&sp[0]);
+            const float* qk = q + (size_t) (kvh * G) * HD;
+            float mrun[HJ], lrun[HJ];
+#pragma unroll
+            for (int j = 0; j < HJ; ++j) { mrun[j] = -FLT_MAX; lrun[j] = 0.0f; }
+            const int d0 = w * KV_Q8_GROUP + lane * VD;
+            float acc[G][VD];
+#pragma unroll
+            for (int h = 0; h < G; ++h)
+#pragma unroll
+                for (int k = 0; k < VD; ++k) acc[h][k] = 0.0f;
+            for (int blk = 0; blk < n_blk; ++blk) {
+                const int c0 = (gi * span + blk) * CHUNK;
+                const int n_here = sycl::min(CHUNK, n_ids - c0);
+                sycl::group_barrier(grp);                         // the last chunk's value pass is done with sp
+                // ---- scores: lane = cell c of the chunk
+                const int c = w * SG + lane;
+                long long r = -1;
+                if (c < n_here) {
+                    const int cell = dense ? c0 + c : ids[c0 + c];
+                    const long long page = (long long) p.page_table[cell / page_size];
+                    if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
+                srow[c] = r;
+                const long long rr = r >= 0 ? r : 0;
+#pragma unroll 1
+                for (int h0 = 0; h0 < G; h0 += HG) {
+                    float s[HG];
+#pragma unroll
+                    for (int h = 0; h < HG; ++h) s[h] = 0.0f;
+#pragma unroll 1
+                    for (int g = 0; g < HD / KV_Q8_GROUP; ++g) {
+                        float part[HG];
+#pragma unroll
+                        for (int h = 0; h < HG; ++h) part[h] = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < KV_Q8_GROUP / 8; ++j) {
+                            const int b = g * (KV_Q8_GROUP / 8) + j;
+                            float kk[8];
+                            fast_k8<KV_MODE>(p, rr, b * 8, kk);
+#pragma unroll
+                            for (int h = 0; h < HG; ++h) {
+                                const float qw = qk[(h0 + h) * HD + b * 8 + (lane & 7)];
+#pragma unroll
+                                for (int e = 0; e < 8; ++e)
+                                    part[h] = sycl::fma(kk[e], sycl::select_from_group(sg, qw, e), part[h]);
+                            }
+                        }
+                        if constexpr (KV_MODE == 1) {
+                            const float ksg = h2f(p.k_scale[rr * (HD / KV_Q8_GROUP) + g]);
+#pragma unroll
+                            for (int h = 0; h < HG; ++h) s[h] = sycl::fma(part[h], ksg, s[h]);
+                        } else {
+#pragma unroll
+                            for (int h = 0; h < HG; ++h) s[h] += part[h];
+                        }
+                    }
+#pragma unroll
+                    for (int h = 0; h < HG; ++h) spf[c * GP + h0 + h] = r >= 0 ? s[h] * scale : -FLT_MAX;
+                }
+                sycl::group_barrier(grp);
+                // ---- online softmax: sub-group w keeps heads w, w + 4, ...
+#pragma unroll
+                for (int j = 0; j < HJ; ++j) {
+                    const int h = w + NSG * j;
+                    if (h >= G) continue;
+                    float a[4], e[4];
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) a[k] = spf[(lane + SG * k) * GP + h];
+                    float m = sycl::fmax(sycl::fmax(a[0], a[1]), sycl::fmax(a[2], a[3]));
+                    m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+                    const float mn = sycl::fmax(mrun[j], m);
+                    float l = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const int cc = lane + SG * k;
+                        e[k] = (cc < n_here && srow[cc] >= 0) ? sycl::exp(a[k] - mn) : 0.0f;
+                        spf[cc * GP + h] = e[k];
+                        l += e[k];
+                    }
+                    l = sycl::reduce_over_group(sg, l, sycl::plus<float>());
+                    const float alpha = mrun[j] == -FLT_MAX ? 0.0f : sycl::exp(mrun[j] - mn);
+                    lrun[j] = sycl::fma(lrun[j], alpha, l);
+                    mrun[j] = mn;
+                    if (lane == 0) salpha[h] = alpha;
+                }
+                sycl::group_barrier(grp);
+                // ---- values: rescale, then fold this chunk's cells in order
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float al = salpha[h];
+#pragma unroll
+                    for (int k = 0; k < VD; ++k) acc[h][k] *= al;
+                }
+                for (int cb = 0; cb < CHUNK; cb += SG) {
+                    const long long rl = srow[cb + lane];
+                    const long long rlc = rl >= 0 ? rl : 0;
+                    const float svl = lanes_v_scale<KV_MODE>(p, rlc, d0);
+                    float pl[GP];
+#pragma unroll
+                    for (int g4 = 0; g4 < GP / 4; ++g4) {
+                        const sycl::float4 v = sp[(size_t) (cb + lane) * (GP / 4) + g4];
+                        pl[4 * g4] = v.x(); pl[4 * g4 + 1] = v.y(); pl[4 * g4 + 2] = v.z(); pl[4 * g4 + 3] = v.w();
+                    }
+#pragma unroll
+                    for (int i0 = 0; i0 < SG; i0 += kLanesVPrefetch) {
+                        LanesRaw<KV_MODE> raw[kLanesVPrefetch];
+#pragma unroll
+                        for (int i = 0; i < kLanesVPrefetch; ++i)
+                            raw[i] = lanes_v4_raw<KV_MODE>(p, sycl::select_from_group(sg, rlc, i0 + i), d0);
+#pragma unroll
+                        for (int i = 0; i < kLanesVPrefetch; ++i) {
+                            if (sycl::select_from_group(sg, rl, i0 + i) < 0) continue;
+                            const float svi = sycl::select_from_group(sg, svl, i0 + i);
+                            float v[VD];
+#pragma unroll
+                            for (int k = 0; k < VD; ++k) v[k] = lanes_v1<KV_MODE>(raw[i], k, svi);
+#pragma unroll
+                            for (int h = 0; h < G; ++h) {
+                                const float wt = sycl::select_from_group(sg, pl[h], i0 + i);
+#pragma unroll
+                                for (int k = 0; k < VD; ++k) acc[h][k] = sycl::fma(wt, v[k], acc[h][k]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < HJ; ++j) {
+                const int h = w + NSG * j;
+                if (h < G && lane == 0) { part_m[slot * G + h] = mrun[j]; part_l[slot * G + h] = lrun[j]; }
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h)
+                *reinterpret_cast<sycl::float4*>(part_acc + ((size_t) slot * G + h) * HD + d0) =
+                    sycl::float4(acc[h][0], acc[h][1], acc[h][2], acc[h][3]);
+        }));
     });
 }
 
@@ -318,8 +830,10 @@ int kv_mode_of(const QsaAttnPools& pools) {
     return pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
 }
 
-template <int HD, int G>
-void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+int kv_mode_of(const QsaAttnSlots& tab) { return tab.mode; }
+
+template <int HD, int G, class Src>
+void run_shape(const float* q, const Src& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
     const int kv_mode = kv_mode_of(pools);
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -329,6 +843,23 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     const float scale = 1.0f / std::sqrt((float) HD);
     auto& queue = queue_for(stream);
     const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
+    if constexpr (HD == 256) {
+        if (fast_on() && kv_mode <= 1 && lanes_rows_ok(n_q)) {
+            const int span = fast_span(n_q, nkv, n_chunks), n_groups = (n_chunks + span - 1) / span;
+            if (kv_mode == 1) launch_chunk_fast<HD, G, 1>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_groups, span, n_q, (int) cap, stride);
+            else launch_chunk_fast<HD, G, 0>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_groups, span, n_q, (int) cap, stride);
+            const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_groups, attn, (size_t) s.n_head, n_q, stride);
+            if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
+            return;
+        }
+        if (lanes_on() && kv_mode <= 1 && lanes_rows_ok(n_q)) {
+            if (kv_mode == 1) launch_chunk_lanes<HD, G, 1>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, n_q, (int) cap, stride);
+            else launch_chunk_lanes<HD, G, 0>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, n_q, (int) cap, stride);
+            const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_chunks, attn, (size_t) s.n_head, n_q, stride);
+            if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
+            return;
+        }
+    }
     if (kv_mode == 3) launch_chunk<HD, G, 3>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, n_q, (int) cap, stride);
     else if (kv_mode == 2) launch_chunk<HD, G, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, n_q, (int) cap, stride);
     else if (kv_mode == 1) launch_chunk<HD, G, 1>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_chunks, n_q, (int) cap, stride);
@@ -345,7 +876,8 @@ bool shape_ok(const QsaShapes& s) {
     return (s.head_dim == 256 && (g == 12 || g == 8)) || (s.head_dim == 128 && g == 10);
 }
 
-void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+template <class Src>
+void run(const float* q, const Src& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
          const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
     const int64_t g = s.n_head / s.n_head_kv;
     if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
@@ -366,6 +898,13 @@ std::string shape_name(const QsaShapes& s) {
 
 }  // namespace
 
+void qsa_decode_attn_set_lanes(int on) { g_lanes_forced = on < 0 ? -1 : (on != 0); }
+
+void qsa_decode_attn_set_fast(int on, int span) {
+    g_fast_forced = on < 0 ? -1 : (on != 0);
+    g_fast_span_forced = span > 0 ? span : 0;
+}
+
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
@@ -373,6 +912,31 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         throw core::DeviceError("qsa_decode_attn_batch: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     run(q, pools, ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s), stream);
+}
+
+bool qsa_attn_slots_set(QsaAttnSlots& tab, int r, const QsaAttnPools& pools) {
+    const int mode = kv_mode_of(pools);
+    if (r < 0 || r >= kQsaSlotsMax || !pools_ok(pools) || !pools.page_table || (tab.mode >= 0 && tab.mode != mode))
+        return false;
+    tab.mode = mode;
+    tab.page_table[r] = pools.page_table;
+    tab.k[r] = mode == 0 ? (const void*) pools.k_pool : mode == 2 ? (const void*) pools.k_q4 : (const void*) pools.k_q;
+    tab.v[r] = mode == 0 ? (const void*) pools.v_pool : mode == 1 ? (const void*) pools.v_q : (const void*) pools.v_q4;
+    tab.k_scale[r] = mode == 1 || mode == 3 ? pools.k_scale : nullptr;
+    tab.v_scale[r] = mode == 1 ? pools.v_scale : nullptr;
+    return true;
+}
+
+void qsa_decode_attn_slots(const float* q, const QsaAttnSlots& tab, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (!shape_ok(s) || cap <= 0 || !scratch || !ids || !steps || n_q > kQsaSlotsMax || tab.mode < 0 || tab.mode > 3)
+        throw core::DeviceError("qsa_decode_attn_slots: unsupported geometry (" + shape_name(s) + "), rows or format");
+    for (int64_t r = 0; r < n_q; ++r)
+        if (!tab.page_table[r] || !tab.k[r] || !tab.v[r])
+            throw core::DeviceError("qsa_decode_attn_slots: a row's pools are missing");
+    // qsa_decode_attn_batch's strides: query r's scratch at r * the single-query size
+    run(q, tab, ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s), stream);
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {

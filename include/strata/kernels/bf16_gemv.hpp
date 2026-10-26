@@ -63,6 +63,14 @@ void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_
 /// the weight read once, every output bit-identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
+/// Optional decode GEMM: split F32 activations into BF16 high + rounded residual,
+/// then run two existing XMX products with FP32 accumulation. Not bit-identical to
+/// MMVF. Caller owns 2*n_tok*n_in uint16 scratch elements, disjoint from x/w/y.
+/// Returns false without submitting when the device, shape or storage cannot take
+/// XMX; the caller retains its established MMVF. No allocation or synchronization.
+/// Positive contiguous input/output strides are required; n_tok is 2..window capacity.
+bool bf16_gemm_fp32_xmx(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                         int64_t n_in, int64_t n_out, int n_tok, uint16_t* scratch, void* stream);
 /// Times bf16_gemv_fp32_mmvf_multi's two forms (a row a work-group, 4 rows a work-group: the same bits) on the stream's
 /// device for an n_in x n_out matrix and 2..8 rows, and keeps the faster for each; call it before any graph is
 /// recorded (once a device and shape).  Untuned shapes take a row a work-group.  STRATA_MMVF_ROWS=0|1 fixes the form.
@@ -75,4 +83,20 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream);
 
+/// homelab STRATA_MMVF_WIDE (default 0): 1, 2 or 4 = bf16_gemv_fp32_mmvf_multi and _aux run 2..16 rows in ONE launch with
+/// the row loop fixed at compile time and that many output rows a work-group, every output the same bits (where n_in's
+/// mmvf work-group is 256 wide; else the established path).  Set before graph capture; for tests.
+void bf16_gemv_set_wide(int rpb);
+int bf16_gemv_wide();
+/// The most rows a wide launch (STRATA_MMVF_WIDE, bf16_router_fused) takes: one instantiation per row count 1..this.
+/// Wider windows run the established multi-row path, or the separate router calls.
+inline constexpr int kWideMaxRows = 16;
+/// homelab STRATA_ROUTER_FUSE (default 0): the router of a 2..kWideMaxRows-row window in ONE launch - the 512-expert logits
+/// (bf16_gemv_fp32_mmvf_multi's bits, ldy 512), the aux row (the shared expert's gate; w_aux may be null), and the
+/// native top-10 of every row (native_router_top10_multi's bits) run by the launch's last work-group to finish.
+/// Returns false (nothing launched) where the shape or alignment does not fit; the caller then runs the separate calls.
+void bf16_router_set_fuse(int on);
+bool bf16_router_fuse();
+bool bf16_router_fused(const float* x, int64_t ldx, const uint16_t* w, float* logits, int64_t n_in, int n_tok,
+                       const uint16_t* w_aux, float* y_aux, int64_t ldy_aux, int32_t* ids, float* weights, void* stream);
 }  // namespace strata::kernels

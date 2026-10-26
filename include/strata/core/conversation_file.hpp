@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
 // the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
@@ -142,6 +143,13 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 // 4 MiB (a slow disk or network folder at 4 MiB/s), at most an hour.  1.2 GB: 345 s.
 int64_t session_phase_limit_s(uint64_t bytes);
 
+// A prefill artifact holds [0, prefix_tokens); its decoder retains final_token. Draft teacher forcing depends on
+// that final token too. Format v2 binds this boundary in the header; ordinary SAVE still writes the unchanged v1.
+struct SessionPrefillBoundary {
+    uint64_t prefix_tokens = 0;
+    int32_t final_token = -1;
+};
+
 // Optional knobs of a write.
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
@@ -151,6 +159,10 @@ struct SessionWriteOptions {
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
+    std::optional<SessionPrefillBoundary> prefill;
+    // The request owner's cancellation/generation gate invokes the actual rename under its lock. False without
+    // invoking it leaves the previous artifact intact. The gate sets `why` when it refuses. No gate for normal SAVE.
+    std::function<bool(const std::function<bool()>& publish, std::string& why)> publication;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
 };
@@ -224,6 +236,9 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Required for a v2 prefill file: exact full coordinator prompt (including the retained final token). A v1 file
+    // is not a prefill artifact. Both boundary and ordered prefix are checked before `image` is replaced.
+    std::optional<std::vector<int64_t>> prefill_prompt;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

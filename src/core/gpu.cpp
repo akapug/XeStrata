@@ -15,9 +15,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace strata::gpu {
 
@@ -179,15 +182,135 @@ void* alloc_device(size_t bytes) {
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
 }
 
-void* alloc_host(size_t bytes) {
+namespace {
+struct PinBlock {
+    size_t bytes;
+    const char* pool;
+};
+std::mutex g_pin_mu;
+std::map<const void*, PinBlock> g_pins;
+std::map<std::string, std::string> g_pin_notes;
+uint64_t g_pinned = 0;
+uint64_t g_pin_cap = 0;
+bool g_pin_cap_set = false;
+
+std::string gib(uint64_t b) {
+    char s[32];
+    std::snprintf(s, sizeof s, b >= (1ull << 30) ? "%.2f GiB" : "%.0f MiB",
+                  b >= (1ull << 30) ? (double) b / 1073741824.0 : (double) b / 1048576.0);
+    return s;
+}
+}  // namespace
+
+uint64_t host_pin_max_bytes() {
+    static const uint64_t env = [] {
+        const char* v = std::getenv("STRATA_HOST_PIN_MAX_GIB");
+        const double g = v != nullptr && v[0] != '\0' ? std::strtod(v, nullptr) : kHostPinMaxGibDefault;
+        return g > 0 ? (uint64_t) (g * 1073741824.0) : 0;
+    }();
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    return g_pin_cap_set ? g_pin_cap : env;
+}
+
+void host_pin_set_max_bytes(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    g_pin_cap = bytes;
+    g_pin_cap_set = true;
+}
+
+uint64_t host_pinned_bytes() {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    return g_pinned;
+}
+
+bool host_pin_reserve(size_t bytes, const char* pool) {
+    const uint64_t cap = host_pin_max_bytes();
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    if (cap > 0 && g_pinned + bytes > cap) {
+        g_error = "alloc_host: " + gib(bytes) + " for " + pool + " refused: STRATA_HOST_PIN_MAX_GIB caps host pins at " +
+                  gib(cap) + " and " + gib(g_pinned) + " are pinned";
+        return false;
+    }
+    g_pinned += bytes;
+    return true;
+}
+
+void host_pin_commit(const void* p, size_t bytes, const char* pool) {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    g_pins[p] = PinBlock{bytes, pool};
+}
+
+void host_pin_cancel(size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    g_pinned -= std::min<uint64_t>(bytes, g_pinned);
+}
+
+size_t host_pin_release(const void* p) {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    const auto it = g_pins.find(p);
+    if (it == g_pins.end()) return 0;
+    const size_t n = it->second.bytes;
+    g_pinned -= std::min<uint64_t>(n, g_pinned);
+    g_pins.erase(it);
+    return n;
+}
+
+void host_pin_detail(const char* pool, const std::string& text) {
+    std::lock_guard<std::mutex> lock(g_pin_mu);
+    g_pin_notes[pool] = text;
+}
+
+std::string host_pin_report() {
+    const uint64_t cap = host_pin_max_bytes();
+    struct Pool {
+        uint64_t bytes = 0;
+        std::map<size_t, int> sizes;
+    };
+    std::map<std::string, Pool> pools;
+    uint64_t total = 0;
+    std::map<std::string, std::string> notes;
+    {
+        std::lock_guard<std::mutex> lock(g_pin_mu);
+        for (const auto& [p, b] : g_pins) {
+            Pool& pl = pools[b.pool];
+            pl.bytes += b.bytes;
+            ++pl.sizes[b.bytes];
+        }
+        total = g_pinned;
+        notes = g_pin_notes;
+    }
+    std::vector<std::pair<std::string, Pool>> order(pools.begin(), pools.end());
+    std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    std::string s = "host pins " + gib(total) + " (STRATA_HOST_PIN_MAX_GIB " + (cap > 0 ? gib(cap) : "off") + ")";
+    for (const auto& [name, pl] : order) {
+        s += "; " + name + " " + gib(pl.bytes) + " =";
+        for (auto it = pl.sizes.rbegin(); it != pl.sizes.rend(); ++it)
+            s += " " + std::to_string(it->second) + " x " + gib(it->first);
+        if (const auto n = notes.find(name); n != notes.end() && !n->second.empty()) s += " [" + n->second + "]";
+    }
+    return s;
+}
+
+void* alloc_host(size_t bytes, const char* pool) {
+    if (!host_pin_reserve(bytes, pool)) return nullptr;
     try {
         void* p = sycl::malloc_host(bytes, rt().context());
-        if (!p) g_error = "alloc_host: " + std::to_string(bytes) + " bytes refused";
+        if (!p) {
+            host_pin_cancel(bytes);
+            g_error = "alloc_host: " + std::to_string(bytes) + " bytes refused";
+            return nullptr;
+        }
+        host_pin_commit(p, bytes, pool);
         return p;
-    } catch (const std::exception& e) { fail("alloc_host", e); return nullptr; }
+    } catch (const std::exception& e) {
+        host_pin_cancel(bytes);
+        fail("alloc_host", e);
+        return nullptr;
+    }
 }
 
 void free(const void* p) {
+    (void) host_pin_release(p);
     {
         std::lock_guard<std::mutex> lock(g_live_mu);
         if (auto it = g_live.find(p); it != g_live.end()) {
@@ -460,6 +583,14 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
         *ms = (float) ((double) (int64_t) (b - a) / 1e6);
         return true;
     } catch (const std::exception& ex) { return fail("event_elapsed_ms", ex); }
+}
+
+bool event_time_ns(const Event* e, uint64_t* ns) {
+    if (!e->ev || !e->timing) { g_error = "event_time_ns: an event was not recorded for timing"; return false; }
+    try {
+        *ns = (uint64_t) e->ev->get_profiling_info<sycl::info::event_profiling::command_end>();
+        return true;
+    } catch (const std::exception& ex) { return fail("event_time_ns", ex); }
 }
 
 bool begin_capture(Stream s) {

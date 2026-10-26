@@ -134,7 +134,7 @@ bool ple_native_bf16() { return native_bf16; }
 void ple_set_native_postops(bool enabled) { native_postops = enabled; }
 bool ple_native_postops_enabled() { return native_postops; }
 
-void ple_history_advance(float* hist, const float* normalized, void* stream) {
+void ple_history_advance(float* hist, const float* normalized, void* stream, const int32_t* keep) {
     if (hist == nullptr || normalized == nullptr)
         throw std::invalid_argument("ple_history_advance: null history or normalized input");
     if (overlap(hist, (size_t) NG_HIST * NG_HC_DIM * sizeof(float),
@@ -142,6 +142,7 @@ void ple_history_advance(float* hist, const float* normalized, void* stream) {
         throw std::invalid_argument("ple_history_advance: history and normalized input overlap");
     auto& q = core::Runtime::get().stream(stream);
     const auto e = q.parallel_for(sycl::range<1>(NG_HC_DIM), [=](sycl::id<1> id) {
+        if (keep != nullptr && *keep == 0) return;
         const int channel = (int) id[0];
         float* column = hist + (size_t) channel * NG_HIST;
         for (int row = 0; row + 1 < NG_HIST; ++row) column[row] = column[row + 1];

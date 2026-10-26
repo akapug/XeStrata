@@ -18,10 +18,9 @@
 #pragma once
 
 #include <cstdint>
+#include "strata/kernels/window_capacity.hpp"
 
 namespace strata::kernels {
-
-inline constexpr int kVerifyMaxT = 8;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, except with `commit` (one token, t_begin 0: a one-token window keeps its token), which
@@ -33,12 +32,64 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
+/// Apply GDN's established softplus/sigmoid to raw alpha/beta projections in place.
+void gdn_ab_activate(float* gate, float* beta, const float* dt, const float* ssm_a,
+                     int h_v, int n_tok, void* stream);
+/// gdn_ab_multi's arguments, for the conv launch that runs it too (STRATA_GDN_AB_FORM 4..6)
+struct GdnAbArgs {
+    const float* x = nullptr;
+    const uint16_t* w_alpha = nullptr;
+    const uint16_t* w_beta = nullptr;
+    const float* dt = nullptr;
+    const float* ssm_a = nullptr;
+    float* gate = nullptr;
+    float* beta = nullptr;
+    int n_embd = 0, h_v = 0, n_tok = 0;
+};
+/// STRATA_GDN_AB_FORM (homelab, default 0): gdn_ab_multi over a sub-group a (row, TC tokens), the same bits; 1, 2, 3 its
+/// own launch (TC 1, 2, 4); 4, 5, 6 the same, and the batch window's GDN layer runs it inside gdn_conv_l2_slots's
+/// launch (gdn_ab_fused_in_conv).  Set before graph capture; for tests.
+void gdn_ab_set_form(int form);
+int gdn_ab_form();
+bool gdn_ab_fused_in_conv();
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y
 /// (T, value_dim)).  With `n_keep == nullptr` the state is read and NOT written (verify); otherwise the first
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* y_q8_1 = nullptr);
+/// BATCH WINDOWS, ONE LAUNCH FOR EVERY SLOT (STRATA_BATCH_GDN_SLOTS).  A batch window's rows belong to different
+/// slots, each with its own conv history and recurrent state; the per-slot loops in record_window launched these two
+/// kernels once per slot and GDN layer (2 x 36 launches a row, each one work-group a head: 32 work-groups on a
+/// 32-core card).  The `slots` forms take a table instead: slot group j covers window rows [first[j], first[j] + ntok[j])
+/// and reads/writes `state[j]` / `hist[j]`.  Every row's arithmetic is the per-slot call's (the plain one-group-a-head
+/// form; the three forms give the same bits), so the tokens are bitwise those of the loop.
+struct GdnSlotTable {
+    float* state[kVerifyMaxT] = {};        ///< slot group j's recurrent state (the layer's)
+    float* hist[kVerifyMaxT] = {};         ///< slot group j's conv history (the layer's; written only with `commit`)
+    int first[kVerifyMaxT] = {};           ///< its first window row
+    int ntok[kVerifyMaxT] = {};            ///< its rows (1 without --batch-mtp)
+    int n = 0;                             ///< slot groups
+    /// With `commit`: device int32 per window row; group j commits its history and state only where keep[first[j]] is
+    /// nonzero (a pad row for an idle slot, keep 0, leaves both as they were).  nullptr: every group commits.
+    const int32_t* keep = nullptr;
+};
+/// gdn_conv_l2_multi for every slot group at once (rows [0, rows) of qkv/h, the window's).  `commit`: every group has
+/// one row and keeps it (STRATA_BATCH_SELF_COMMIT): each history is left as gdn_conv_commit with n_keep 1 leaves it.
+/// `ab` (STRATA_GDN_AB_FORM 4..6): gdn_ab_multi(*ab) in the same launch, its bits (its own work-groups, after the conv's).
+void gdn_conv_l2_slots(const GdnSlotTable& tab, const float* qkv, const float* conv_w, float* h, int channels,
+                       int qk_heads, float eps, void* stream, bool commit = false, const GdnAbArgs* ab = nullptr);
+/// STRATA_BATCH_GDN_FORM for tests: gdn_step_norm_slots's form (0 plain, 1 split, 2 large register file, 3 block
+/// loads and stores, 4 both, 5 block in 16-lane sub-groups; every form gives the same bits); before graph capture.
+void gdn_slots_set_form(int form);
+/// The forms gdn_slots_set_form takes: [0, gdn_slots_forms()).
+int gdn_slots_forms();
+/// gdn_step_norm_multi for every slot group at once.  `commit`: each group runs all its rows and writes its state (the
+/// one-row self-commit); else the states are read only (verify).  `y_q8_1`: the window's q8_1 image of y from row
+/// `row0` on (the caller's xq_ for the group [row0, ...)), as the per-slot calls' QFUSE pointer.
+void gdn_step_norm_slots(const GdnSlotTable& tab, const float* h, int conv_channels, const float* gate,
+                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                         bool commit, void* stream, int row0 = 0, void* y_q8_1 = nullptr);
 /// The commit of `n_layers` GDN layers in two launches (upstream 6f3e3810): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
@@ -54,6 +105,11 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// fastest; call it before any graph is recorded (once a device; later calls return at once).  Untuned, the
 /// one-work-group-a-head form runs.  STRATA_GDN_STEP=0|1|2 fixes the form.
 void gdn_step_tune(int conv_channels, int h_k, int h_v, void* stream);
+/// For tests, before graph capture: STRATA_GDN_STEP's form for gdn_step_norm_multi (0 one group a head, 1 split,
+/// 2 prefetch; -1 the tuned one), and STRATA_GDN_BLOCK_GRF (block loads/stores and the large register file in the
+/// per-slot recurrence and the state commit; the same bits).
+void gdn_step_set_form(int form);
+void gdn_step_set_block_grf(bool on);
 /// Whether side branches of a graph pay on this device: 16 rounds of eight small kernels in a row and three more,
 /// recorded in a row on `stream`, against the three as one on `stream` beside one on each of `side0` / `side1`
 /// (forked from `stream` and joined back, as the window's GDN layer branches), each graph replayed in turns; true when
@@ -67,10 +123,14 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// kernel runs (the verify window then runs in host-launched segments); the B70 sees both.  Synchronizes `stream`.
 bool doorbell_visible(void* stream);
 /// The device clock into buf[i] (a one-thread kernel: the verify window's stage profiler).  CUDA wrote %globaltimer
-/// in ns; SYCL's device-scope clock counts ticks of an unspecified rate, so stamps are only compared with each other.
+/// in ns; SYCL's clocks count ticks of an unspecified rate (the B70's sub-group clock: GPU core cycles), so the
+/// profiler measures each window's rate (Verifier::accumulate_profile).  The clock's scope: STRATA_VERIFY_PROFILE_CLOCK
+/// (device, sub_group or work_group; default device), else the first of them the device has.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
-/// Whether the device has the device-scope clock gpu_stamp reads (the B70 does not).
+/// Whether the device has a clock gpu_stamp reads (the B70: the sub-group clock alone).
 bool gpu_stamp_available();
+/// The clock scope gpu_stamp reads: "device", "sub_group", "work_group", or "none".
+const char* gpu_stamp_clock();
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

@@ -12,10 +12,15 @@
 #include "strata/core/runtime.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <vector>
 
 namespace strata::parity {
+
+// A qualification run writes stdout to a file and can be stopped at its deadline.  Line buffering keeps every line
+// printed before the stop; a full buffer lost the whole trail (homelab: hc_read16_parity left a zero-byte log at 120 s).
+inline const bool kStdoutLineBuffered = [] { return std::setvbuf(stdout, nullptr, _IOLBF, 0) == 0; }();
 
 // The compute queue as the kernels' `stream` argument.
 inline void* stream() { return &core::Runtime::get().compute(); }

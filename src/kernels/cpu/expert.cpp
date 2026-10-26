@@ -7,6 +7,7 @@
 // The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
 // include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
+#include <algorithm>
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
@@ -475,6 +476,11 @@ void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* o
 
 void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
                              int r1) {
+    if (n_tokens > kExpertTileT) {
+        for (int t = 0; t < n_tokens; t += kExpertTileT)
+            s2_expert_gu_rows_multi(blob, a1 + t, std::min(n_tokens - t, kExpertTileT), ff + t, r0, r1);
+        return;
+    }
     switch (n_tokens) {
         case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
         case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
@@ -489,6 +495,11 @@ void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_t
 
 void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
                                int r1) {
+    if (n_tokens > kExpertTileT) {
+        for (int t = 0; t < n_tokens; t += kExpertTileT)
+            s2_expert_down_rows_multi(blob, a2 + t, std::min(n_tokens - t, kExpertTileT), out + t, r0, r1);
+        return;
+    }
     switch (n_tokens) {
         case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
         case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
@@ -550,6 +561,11 @@ void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const
 
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1) {
+    if (nt > kExpertTileT) {
+        for (int t = 0; t < nt; t += kExpertTileT)
+            q2_0_gguf_rows_multi(w, row_bytes, nblocks, a + t, std::min(nt - t, kExpertTileT), out + t, r0, r1);
+        return;
+    }
     switch (nt) {
         case 1: q2g_rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 2: q2g_rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
@@ -564,6 +580,11 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 
 void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
                           ExpertScratchMulti& ws) {
+    if (n_tokens > kExpertTileT) {
+        for (int t = 0; t < n_tokens; t += kExpertTileT)
+            s2_expert_vnni_multi(blob, a1 + t, std::min(n_tokens - t, kExpertTileT), out + t, ws);
+        return;
+    }
     if (expert_oracle_q8_0_enabled() || n_tokens < 1 || n_tokens > MAXT) {
         for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;

@@ -130,6 +130,16 @@ struct MappedCopy {
     int64_t words = 0;
 };
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream);
+/// homelab K2: `rows` rows of up to 4 strided pieces in ONE launch (a batch window's hand-off, which took a launch per
+/// row and piece): dst + r * dst_stride <- src + r * src_stride, `n` floats each, either side mapped host memory (its
+/// device alias) or device memory.  Each element is copy_from_mapped's: the same bytes.  n a multiple of 4, every
+/// pointer and stride 16-byte aligned.  Graph-capturable.
+struct RowsCopy {
+    float* dst = nullptr;
+    const float* src = nullptr;
+    int64_t n = 0, dst_stride = 0, src_stride = 0;
+};
+void copy_rows_mapped_multi(const RowsCopy* pieces, int n_pieces, int rows, void* stream);
 /// `rows` rows of 2n floats: row r of `a` (n floats), then row r of `b` (the MTP layer's input, [embedding | hidden]).
 /// n a multiple of 4, every pointer 16-byte aligned.  Graph-capturable.
 void concat_rows(float* dst, const float* a, const float* b, int64_t n, int64_t rows, void* stream);

@@ -22,6 +22,7 @@
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/dmmq_contract.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
@@ -46,6 +47,7 @@ namespace strata::kernels {
 namespace {
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
+namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 using namespace iq_bits;
 using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte access (sycl::uint4 is split on NVPTX)
@@ -1174,6 +1176,165 @@ struct LayoutCheck {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
 };
 
+
+// ---------------------------------------------------------------- homelab K1: the batch window's dense products
+// A decode window multiplies 1..16 rows by a dense matrix of thousands of outputs.  The q8_1 GEMV (native_mmvq) decodes
+// every weight block once per column, so its work grows with the rows (7-17x the bandwidth floor at 16 rows); the
+// prompt tiles above decode once for 16-64 rows but cut the outputs into 128-wide tiles with K walked by one work-group
+// (2,560 outputs: 20 work-groups for 32 Xe-cores, ~200 us for 9 MB).  Here a sub-group owns 16 outputs (a lane its row,
+// Intel's accumulator column) over a slice of K, decodes each block of 32 once into its registers, hands it to the XMX
+// engines through 512 bytes of its own local memory, and multiplies it by up to 16 rows (two 8-row tiles) at once; KS
+// sub-groups of a work-group split K and add their sums through local memory in a fixed order (no atomics: every run
+// the same bits).  The weights' scales stay in the lane that decoded them, which is the column its accumulator holds.
+template<int TY, int MR>
+struct DecodeKernel {
+    static constexpr bool HALF = half_scales<TY>();
+    static constexpr bool MIN = has_min<TY>();
+    static constexpr int IM = 8, IK = 32, IN = 16, U = 4;
+    static constexpr int B_BYTES = (HALF ? 2 : 1) * IK * IN;   // a sub-group's B tile(s), VNNI
+    const uint8_t* w;
+    size_t row_bytes;
+    const int8_t* xq;
+    const float* xs;
+    const float* xu;
+    int64_t K;
+    int rows, ks, per;   // per: blocks of 32 a sub-group's slice
+    float* dst;
+    int64_t ld_dst;
+    sycl::local_accessor<uint8_t, 1> lm;
+
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_IQ_MMQ_INTEL
+        const auto sg = it.get_sub_group();
+        const int s = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int lid = (int) it.get_local_id(0);
+        const int64_t n0 = (int64_t) it.get_group(0) * IN;
+        const int nb = (int) (K / 32);
+        const uint8_t* wr = w + (size_t) (n0 + lane) * row_bytes;
+        const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
+        const auto bp = local_as<int8_t>(base + s * B_BYTES);
+        uint32_t* bw = local_as<uint32_t>(base + s * B_BYTES).get();
+        const auto gx = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+            const_cast<int8_t*>(xq));
+        // homelab: the tile count as a select with a compile-time bound (served 9df5bce's `rows > IM ? 2 : 1` at MR 16),
+        // so the tile loops unroll and acc stays in registers; (rows + IM - 1) / IM has no bound the compiler sees
+        static_assert(MR == 2 * IM || MR == 4 * IM, "DecodeKernel: 16 or 32 rows");
+        const int tiles = MR == 2 * IM ? (rows > IM ? 2 : 1)
+                                       : (rows > 3 * IM ? 4 : rows > 2 * IM ? 3 : rows > IM ? 2 : 1);
+        float acc[MR / IM][IM];
+        for (int t = 0; t < MR / IM; ++t)
+            for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
+        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+        const int b0 = s * per, b1 = sycl::min(nb, b0 + per);
+        for (int b = b0; b < b1; b += U) {
+            Sub d[U];
+            #pragma unroll
+            for (int u = 0; u < U; ++u)
+                if (b + u < b1) d[u] = Dec<TY>::get(wr, b + u, row_bytes);
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int kb = b + u;
+                if (kb >= b1) break;
+                // the lane's 32 values as Intel's VNNI B column (a word: 4 K values of the lane's output); a type with
+                // a scale per 16 values writes two tiles, each with the other half zeroed
+                for (int j = 0; j < 8; ++j) {
+                    if constexpr (HALF) {
+                        bw[j * IN + lane] = j < 4 ? d[u].v[j] : 0u;
+                        bw[(8 + j) * IN + lane] = j < 4 ? 0u : d[u].v[j];
+                    } else {
+                        bw[j * IN + lane] = d[u].v[j];
+                    }
+                }
+                sycl::group_barrier(sg);
+                for (int h = 0; h < (HALF ? 2 : 1); ++h) {
+                    mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, IK, IN, mx::layout::ext_intel_packed> bm;
+                    mx::joint_matrix_load(sg, bm, bp + h * IK * IN, IN * 4);
+                    const float ws = h ? d[u].s1 : d[u].s0;
+                    for (int t = 0; t < tiles; ++t) {
+                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, IM, IK, mx::layout::row_major> a;
+                        if (t * IM + IM <= rows)
+                            mx::joint_matrix_load(sg, a, gx + (int64_t) t * IM * K + (int64_t) kb * 32, K);
+                        else   // the rows past the window's read as zeros
+                            ix::joint_matrix_load_checked(sg, a, gx, K, rows, K, t * IM, (int64_t) kb * 32);
+                        mx::joint_matrix_fill(sg, ci, 0);
+                        mx::joint_matrix_mad(sg, ci, a, bm, ci);
+                        int i = 0;
+                        mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                            const int r = t * IM + i;
+                            const float xr = r < rows ? xs[(int64_t) r * nb + kb] : 0.0f;
+                            acc[t][i] = sycl::fma(ws * xr, static_cast<float>(c), acc[t][i]);
+                            ++i;
+                        });
+                    }
+                }
+                if constexpr (MIN)   // less the weights' min of the lane's column times each row's block sum
+                    for (int t = 0; t < tiles; ++t)
+                        for (int i = 0; i < IM; ++i) {
+                            const int r = t * IM + i;
+                            if (r < rows) acc[t][i] -= d[u].m * xu[(int64_t) r * nb + kb];
+                        }
+                sycl::group_barrier(sg);   // the tile is read before the next block overwrites it
+            }
+        }
+        // the slices' sums, added in slice order: KS x 16 rows x 16 outputs in the local memory the tiles used
+        sycl::group_barrier(it.get_group());
+        float* red = local_as<float>(base).get();
+        for (int t = 0; t < tiles; ++t)
+            for (int i = 0; i < IM; ++i)
+                if (t * IM + i < rows) red[(s * MR + t * IM + i) * IN + lane] = acc[t][i];
+        sycl::group_barrier(it.get_group());
+        for (int v = lid; v < rows * IN; v += ks * IN) {
+            const int r = v / IN, c = v % IN;
+            float sum = 0.0f;
+            for (int j = 0; j < ks; ++j) sum += red[(j * MR + r) * IN + c];
+            dst[(int64_t) r * ld_dst + n0 + c] = sum;
+        }
+#else
+        (void) it;
+#endif
+    }
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(16)>,
+                                  sycl::ext::intel::experimental::grf_size<256>};
+    }
+};
+
+// STRATA_DMMQ_SGS: sub-groups a decode product aims for over the card (default 2048: the B70's 32 Xe-cores x 8 vector
+// engines x 8 threads); STRATA_DMMQ_KS: the K split a work-group takes, overriding the aim (1, 2, 4, 8 or 16; 0 = aim)
+constexpr int kDmmqSgsDefault = 2048;
+constexpr int kDmmqKsMax = 16;
+int g_dmmq_sgs = -1, g_dmmq_ks = -1;   // -1: not yet read from the environment
+int dmmq_env(const char* name, int def) {
+    const char* v = std::getenv(name);
+    return v == nullptr || *v == 0 ? def : (int) std::strtol(v, nullptr, 10);
+}
+
+template<int TY, int MR>
+sycl::event decode_launch(sycl::queue& q, const void* w, int64_t w_rows, int64_t w_cols, const void* xq, int64_t rows,
+                          float* dst, int64_t ld_dst) {
+    using KT = DecodeKernel<TY, MR>;
+    if (g_dmmq_sgs < 0) g_dmmq_sgs = dmmq_env("STRATA_DMMQ_SGS", kDmmqSgsDefault);
+    if (g_dmmq_ks < 0) g_dmmq_ks = dmmq_env("STRATA_DMMQ_KS", 0);
+    const int sgs = g_dmmq_sgs, ks_set = g_dmmq_ks;
+    const int64_t tiles = w_rows / KT::IN;
+    const int nb = (int) (w_cols / 32);
+    int ks = ks_set > 0 ? ks_set : 1;
+    if (ks_set <= 0)
+        while (ks < kDmmqKsMax && tiles * ks < sgs && nb / (2 * ks) >= KT::U) ks *= 2;
+    ks = std::min(ks, kDmmqKsMax);
+    const int per = (nb + ks - 1) / ks;
+    const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
+    const auto* x8 = static_cast<const int8_t*>(xq);
+    const auto* xs = reinterpret_cast<const float*>(x8 + rows * w_cols);
+    const auto* xu = xs + rows * (w_cols / 32);
+    const size_t local = std::max((size_t) ks * KT::B_BYTES, (size_t) ks * MR * KT::IN * sizeof(float));
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(local), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) tiles * ks * KT::IN, (size_t) ks * KT::IN),
+                       KT{static_cast<const uint8_t*>(w), row_bytes, x8, xs, xu, w_cols, (int) rows, ks, per, dst,
+                          ld_dst, lm});
+    });
+}
 }  // namespace
 
 bool iq_mmq_usable(sycl::queue& q) {
@@ -1301,6 +1462,44 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
     });
 }
 
+sycl::event iq_mmq_swiglu_quantize(sycl::queue& q, const float* gate, const float* up, void* xq, int64_t cols,
+                                   int64_t rows, bool sums) {
+    // iq_mmq_quantize of silu(gate) * up (native_swiglu's expression), rows of `cols` contiguous values
+    auto* x8 = static_cast<int8_t*>(xq);
+    auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
+    const int64_t nb = cols / 32;
+    float* xu = xs + rows * nb;
+    return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
+#pragma clang fp contract(off)
+        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
+        const float* gr = gate + r * cols + b * 32;
+        const float* ur = up + r * cols + b * 32;
+        float v[32], amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const float g = gr[j];
+            v[j] = g / (1.0f + sycl::exp(-g)) * ur[j];
+            amax = sycl::fmax(amax, sycl::fabs(v[j]));
+        }
+        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
+        uint32_t p[8];
+        int sum = 0;
+        for (int j = 0; j < 8; ++j) {
+            uint32_t u = 0;
+            for (int kk = 0; kk < 4; ++kk) {
+                const int qv = (int) sycl::round(v[4 * j + kk] * id);
+                sum += qv;
+                u |= (uint32_t) (uint8_t) (int8_t) qv << (8 * kk);
+            }
+            p[j] = u;
+        }
+        u32x4* o = reinterpret_cast<u32x4*>(x8 + r * cols + b * 32);
+        o[0] = u32x4{p[0], p[1], p[2], p[3]};
+        o[1] = u32x4{p[4], p[5], p[6], p[7]};
+        xs[r * nb + b] = d;
+        if (sums) xu[r * nb + b] = d * (float) sum;
+    });
+}
+
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
                                     int64_t ld, int64_t tokens, int k_used, bool sums, bool dup) {
     // as iq_mmq_quantize, with the rows reached from the token: the block of token t goes to its k_used rows
@@ -1370,6 +1569,59 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         default: return {};
     }
 #undef STRATA_MMQ_CASE
+}
+
+bool iq_mmq_decode_native_q8_1() {
+    static const bool enabled = dmmq::native_q8_1_requested(std::getenv("STRATA_DMMQ_NATIVE_Q8_1"));
+    return enabled;
+}
+
+sycl::event iq_mmq_decode_from_q8_1(sycl::queue& q, const void* native, void* xq, int64_t cols, int64_t rows, bool sums) {
+    if (!dmmq::native_q8_1_storage_ok(native, xq, cols, rows))
+        throw std::invalid_argument("iq_mmq_decode_from_q8_1: needs nonoverlapping storage and complete rows within the window capacity");
+    const int64_t blocks = rows * (cols / 32);
+    return q.parallel_for(sycl::range<1>((size_t) blocks), [=](sycl::id<1> i) {
+        dmmq::native_q8_1_planar_block<sycl::half>(native, xq, blocks, (int64_t) i[0], sums);
+    });
+}
+
+bool iq_mmq_decode_ok(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int64_t rows) {
+    return dmmq::shape_ok(t, w_rows, w_cols, rows) && intel_shape_of(q) == 1;
+}
+
+void iq_mmq_decode_set_split(int ks, int sgs) {
+    g_dmmq_ks = ks;
+    g_dmmq_sgs = sgs;
+}
+
+sycl::event iq_mmq_decode(sycl::queue& q, int t, const void* w, int64_t w_rows, int64_t w_cols, const void* xq,
+                          int64_t rows, float* dst, int64_t ld_dst) {
+    if (!w || !xq || !dst || ld_dst < w_rows || !iq_mmq_decode_ok(q, t, w_rows, w_cols, rows))
+        throw std::invalid_argument("iq_mmq_decode: unsupported device, type, shape, storage or output stride");
+#define STRATA_DMMQ_CASE(TY) \
+    case TY: return rows <= 16 ? decode_launch<TY, 16>(q, w, w_rows, w_cols, xq, rows, dst, ld_dst) \
+                               : decode_launch<TY, dmmq::kMaxRows>(q, w, w_rows, w_cols, xq, rows, dst, ld_dst)
+    switch (t) {
+        STRATA_DMMQ_CASE(6);
+        STRATA_DMMQ_CASE(8);
+        STRATA_DMMQ_CASE(11);
+        STRATA_DMMQ_CASE(12);
+        STRATA_DMMQ_CASE(13);
+        STRATA_DMMQ_CASE(14);
+        STRATA_DMMQ_CASE(kNativeQ6KRows);
+        STRATA_DMMQ_CASE(kNativeQ8Rows);
+        STRATA_DMMQ_CASE(16);
+        STRATA_DMMQ_CASE(17);
+        STRATA_DMMQ_CASE(18);
+        STRATA_DMMQ_CASE(20);
+        STRATA_DMMQ_CASE(21);
+        STRATA_DMMQ_CASE(22);
+        STRATA_DMMQ_CASE(23);
+        STRATA_DMMQ_CASE(29);
+        STRATA_DMMQ_CASE(42);
+        default: return {};
+    }
+#undef STRATA_DMMQ_CASE
 }
 
 }  // namespace strata::kernels

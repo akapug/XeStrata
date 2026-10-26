@@ -4,7 +4,13 @@
 // CPU-only tests for the on-disk session format (include/strata/core/conversation_file.hpp).
 // Built with the tests (STRATA_BUILD_TESTS); no GPU, no model.
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/layout.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/program/prefill_export.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/ngram.hpp"
+#include "strata/kernels/qsa.hpp"
 
 #include <array>
 #include <cerrno>
@@ -97,6 +103,68 @@ SavedConversation sample() {
     return s;
 }
 
+// A small, layout-shaped whole session, not an engine capture: GDN rows each contain recurrence THEN convolution;
+// the running state includes PLE and every main layer's indexer. Main K/V layers precede the indexer-free draft.
+// These opaque synthetic bytes test serialization, not whether prefill computed the right state.
+SavedConversation handoff_image(size_t tokens, int format) {
+    using namespace strata::kernels;
+    ModelGeometry g;
+    g.n_layers = 8; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    const auto shape = qsa_real_shapes();
+    const size_t recurrence = g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size * sizeof(float);
+    const size_t convolution = g.ssm_conv_channels * (g.ssm_d_conv - 1) * sizeof(float);
+    SavedConversation s;
+    s.geometry = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads,
+                  g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim, g.n_head, g.n_head_kv, g.head_dim,
+                  g.idx_q_heads, g.idx_key_dim, g.hc, g.hc_lr, g.n_expert, g.n_ff};
+    s.layer_lo = 0; s.layer_hi = 0; // the uncarved whole-session layout
+    auto state = [&](size_t n, uint8_t seed) {
+        ConversationCheckpoint c;
+        // Repeated IDs and zero make ordered equality distinguishable from sets and token-null assumptions.
+        const std::array<int32_t, 9> ids = {11, 29, 11, 0, 41, 17, 11, 83, 5};
+        for (size_t i = 0; i < n; ++i) c.ids.push_back(ids[i % ids.size()]);
+        for (int64_t at : {int64_t(0), shape.page_size})
+            if ((uint64_t) at < n) c.imgs.push_back({at, uint64_t(71 + at)});
+        for (int64_t row = 0; row < g.n_gdn_layers(); ++row) {
+            const auto r = bytes_of(recurrence, uint8_t(seed + row * 2));
+            const auto v = bytes_of(convolution, uint8_t(seed + row * 2 + 1));
+            c.gdn.insert(c.gdn.end(), r.begin(), r.end());
+            c.gdn.insert(c.gdn.end(), v.begin(), v.end());
+        }
+        c.ple = bytes_of(size_t(NG_HIST) * NG_HC_DIM * sizeof(float), seed + 20);
+        c.tails = bytes_of(g.n_qsa_layers() * (shape.idx_block - 1) * g.idx_key_dim * sizeof(float), seed + 21);
+        c.dead = bytes_of(g.n_qsa_layers() * g.idx_key_dim * sizeof(float), seed + 22);
+        c.block_pos.resize(g.n_qsa_layers() * sizeof(int32_t));
+        for (int64_t row = 0; row < g.n_qsa_layers(); ++row) {
+            const int32_t pos = int32_t(n % shape.idx_block);
+            std::memcpy(c.block_pos.data() + row * sizeof(pos), &pos, sizeof(pos));
+        }
+        c.used = 42 + seed;
+        c.pinned = true; c.origin = 99; c.shared = true; // real runtime-only fields, never persisted
+        return c;
+    };
+    s.live = state(tokens, 1);
+    s.checkpoints.push_back(state(tokens > 1 ? tokens - 1 : 1, 33));
+    const int64_t cells = ((tokens + shape.page_size - 1) / shape.page_size) * shape.page_size;
+    for (int64_t layer = 0; layer <= g.n_qsa_layers(); ++layer) {
+        ConversationKv k;
+        k.format = format; k.cells = cells; k.heads = g.n_head_kv; k.head_dim = g.head_dim;
+        k.page_size = shape.page_size; k.idx_dim = g.idx_key_dim;
+        k.pooled_rows = layer == g.n_qsa_layers() ? 0 : tokens / shape.idx_block + 1;
+        const size_t per = format == kKvQ4 ? kv_q4_bytes_per_head((int) g.head_dim)
+                                         : g.head_dim * (format == kKvInt8 ? 1 : 2);
+        k.k = pattern(cells * g.n_head_kv * per, uint8_t(50 + layer));
+        k.v = pattern(k.k.size(), uint8_t(60 + layer));
+        const size_t scales = format == kKvInt8 ? cells * g.n_head_kv * (g.head_dim / 64) * sizeof(uint16_t) : 0;
+        k.k_scale = pattern(scales, uint8_t(70 + layer));
+        k.v_scale = pattern(scales, uint8_t(80 + layer));
+        k.pooled = pattern(k.pooled_rows * g.idx_key_dim * sizeof(float), uint8_t(90 + layer));
+        s.kv.push_back(std::move(k));
+    }
+    return s;
+}
+
 // format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
 constexpr size_t kGoldenSize = 17878535;
 constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
@@ -142,15 +210,260 @@ bool no_temp(const fs::path& dir) {
 
 bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expect = nullptr,
              const SessionReadLimits& limits = {}) {
-    SavedConversation out;
+    const SavedConversation before = handoff_image(5, strata::kernels::kKvInt8);
+    SavedConversation out = before;
     size_t bytes = 0;
     std::string error;
     const bool ok = session_file_read(p.string(), id, out, bytes, error, limits);
+    if (!ok) {
+        check(same(before, out), "every refused read preserves all destination payloads and layout metadata");
+        const auto marks = [](const ConversationCheckpoint& c) { return c.pinned && c.origin == 99 && c.shared; };
+        check(marks(out.live) && marks(out.checkpoints[0]), "a refused read also preserves runtime-only marks");
+    }
     if (!ok && expect && error.find(expect) == std::string::npos) {
         std::fprintf(stderr, "  unexpected error text: %s (wanted %s)\n", error.c_str(), expect);
         return false;
     }
     return !ok && !error.empty();
+}
+
+// Independently staged producer/consumer objects, in one process. No device restore or two-process proof is claimed.
+void staged_handoff(const fs::path& dir) {
+    using namespace strata::kernels;
+    const fs::path producer_dir = dir / "producer", consumer_dir = dir / "consumer";
+    fs::create_directories(producer_dir); fs::create_directories(consumer_dir);
+    const fs::path model = producer_dir / "synthetic-model.bin", moved_model = consumer_dir / model.filename();
+    spit(model, std::vector<char>(257, 'm'));
+    fs::copy_file(model, moved_model);
+    const std::vector<SessionModelFile> producer_files = {{"native shard 0", model.string()}};
+    const std::vector<SessionModelFile> consumer_files = {{"native shard 0", moved_model.string()}};
+    SessionConfig config;
+    config.engine_version = "synthetic-session-v1"; config.backend = "xe";
+    config.max_context = 96; config.mtp_window = 4;
+    for (int format : {kKvF16, kKvInt8, kKvQ4}) for (size_t tokens : {size_t(1), size_t(3), size_t(4), size_t(5), size_t(9)}) {
+        config.kv = format == kKvF16 ? "fp16" : format == kKvInt8 ? "int8" : "q4";
+        SessionFileIdentity producer_id, consumer_id;
+        std::string error;
+        check(session_model_fingerprint(producer_files, producer_id.model, error) &&
+              session_model_fingerprint(consumer_files, consumer_id.model, error) &&
+              producer_id.model == consumer_id.model, "handoff: model identity survives a changed folder");
+        producer_id.config = session_config_fingerprint(config);
+        consumer_id.config = session_config_fingerprint(config);
+        const fs::path produced = producer_dir / "state.bin", consumed = consumer_dir / "state.bin";
+        size_t written = 0;
+        {
+            SavedConversation producer = handoff_image(tokens, format);
+            check(session_file_write(produced.string(), producer, producer_id, written, error), "handoff: producer writes");
+        } // producer, its running state and every K/V allocation are gone before the consumer exists
+        fs::remove(consumed);
+        fs::rename(produced, consumed);
+        check(!fs::exists(produced), "handoff: consumer has only the relocated artifact");
+        SavedConversation consumer = handoff_image(5, kKvInt8);
+        size_t read = 0;
+        check(session_file_read(consumed.string(), consumer_id, consumer, read, error) && read == written,
+              "handoff: independent consumer reads with its own identity");
+        const SavedConversation expected = handoff_image(tokens, format); // regenerated, not the producer's storage
+        check(same(expected, consumer), "handoff: all GDN/conv, PLE, indexer, main/draft K/V and metadata survive");
+        const auto local_only = [](const ConversationCheckpoint& c) { return !c.pinned && !c.origin && !c.shared; };
+        check(local_only(consumer.live) && local_only(consumer.checkpoints[0]),
+              "handoff: runtime-only pin/origin/shared marks do not cross the file boundary");
+        check(consumer.kv.back().pooled.empty() && !consumer.kv.front().pooled.empty(),
+              "handoff: draft remains indexer-free, main keeps its spare pooled row");
+        if (format == kKvInt8 && tokens == 5) {
+            SessionReadLimits limits;
+            limits.geometry = expected.geometry;
+            limits.layer_range = std::make_pair(expected.layer_lo, expected.layer_hi);
+            limits.max_tokens = tokens; limits.max_checkpoints = expected.checkpoints.size();
+            limits.max_kv_layers = expected.kv.size();
+            limits.max_state_bytes = {expected.live.gdn.size(), expected.live.ple.size(), expected.live.tails.size(),
+                                      expected.live.dead.size(), expected.live.block_pos.size()};
+            for (const auto& k : expected.kv)
+                limits.max_kv_bytes.push_back({k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(), k.pooled.size()});
+            SavedConversation bounded;
+            check(session_file_read(consumed.string(), consumer_id, bounded, read, error, limits) && same(expected, bounded),
+                  "handoff: all exact state and per-layer limits admit the complete artifact");
+            for (size_t part = 0; part < limits.max_state_bytes.size(); ++part) {
+                auto short_limit = limits; --short_limit.max_state_bytes[part];
+                check(rejects(consumed, consumer_id, "limit", short_limit),
+                      "handoff: every running-state part is bounded before destination mutation");
+            }
+            for (size_t layer = 0; layer < expected.kv.size(); ++layer)
+                for (size_t part = 0; part < limits.max_kv_bytes[layer].size(); ++part) {
+                    if (!limits.max_kv_bytes[layer][part]) continue;
+                    auto short_limit = limits; --short_limit.max_kv_bytes[layer][part];
+                    check(rejects(consumed, consumer_id, "limit", short_limit),
+                          "handoff: every main/draft K/V part is bounded before destination mutation");
+                }
+            auto foreign = limits; (*foreign.geometry)[3]++;
+            check(rejects(consumed, consumer_id, "geometry", foreign), "handoff: incompatible state geometry rejected");
+            foreign = limits; foreign.layer_range->second++;
+            check(rejects(consumed, consumer_id, "layer", foreign), "handoff: incompatible layer layout rejected");
+        }
+
+        std::vector<int32_t> prompt = consumer.live.ids;
+        check(conversation_prefix(consumer.live, prompt, consumer.live.imgs) == 0,
+              "handoff: equal length cannot reuse the decoder's final prompt token");
+        prompt.push_back(101);
+        check(conversation_prefix(consumer.live, prompt, consumer.live.imgs) == (int64_t) tokens,
+              "handoff: only the exact ordered prefix strictly before the final token is reusable");
+        prompt.back() = 0;
+        check(conversation_prefix(consumer.live, prompt, consumer.live.imgs) == (int64_t) tokens,
+              "handoff: the final token outside the saved prefix does not change its identity");
+        for (size_t at = 0; at < tokens; ++at) {
+            auto changed = prompt; changed[at] ^= 1;
+            check(conversation_prefix(consumer.live, changed, consumer.live.imgs) == 0,
+                  "handoff: changing any saved token rejects the whole live prefix");
+        }
+        if (tokens > 1) {
+            auto permuted = prompt; std::swap(permuted[0], permuted[1]);
+            check(conversation_prefix(consumer.live, permuted, consumer.live.imgs) == 0,
+                  "handoff: equal token multiset in a different order is not a prefix");
+        }
+        auto images = consumer.live.imgs;
+        images.push_back({(int64_t) tokens, 999});
+        check(conversation_prefix(consumer.live, prompt, images) == (int64_t) tokens,
+              "handoff: image beginning exactly at the saved boundary belongs to the suffix");
+        images.back().start = (int64_t) tokens - 1;
+        check(conversation_prefix(consumer.live, prompt, images) == 0,
+              "handoff: an added image one token inside the saved boundary rejects reuse");
+        auto changed_config = config; changed_config.backend += "-other";
+        check(rejects(consumed, {consumer_id.model, session_config_fingerprint(changed_config)}, "config"),
+              "handoff: no cross-backend artifact admission");
+        changed_config = config; changed_config.kv += "-other";
+        check(rejects(consumed, {consumer_id.model, session_config_fingerprint(changed_config)}, "config"),
+              "handoff: incompatible K/V configuration rejected before destination mutation");
+    }
+}
+// The real file producer and typed command parser, with independent synthetic state; no GPU prefill is simulated.
+void prefill_handoff(const fs::path& dir) {
+    using namespace strata::program;
+    using namespace strata::kernels;
+    const SessionFileIdentity identity{137, 239};
+    const fs::path path = dir / "prefill.bin";
+    size_t written = 0, read = 0;
+    std::string error;
+    PrefillRequest request;
+    check(parse_prefill_request("PREFILL 11,29,11,0,41,17 " + path.string(), request, error),
+          "prefill: real typed producer command");
+    for (int format : {kKvF16, kKvInt8, kKvQ4, kKvHybrid}) {
+        SavedConversation producer = handoff_image(request.ids.size() - 1, format);
+        producer.live.imgs.clear();
+        for (auto& c : producer.checkpoints) c.imgs.clear();
+        if (format == kKvHybrid) {
+            for (size_t layer = 0; layer < producer.kv.size(); ++layer) {
+                auto& k = producer.kv[layer];
+                const bool draft = layer + 1 == producer.kv.size();
+                k.format = draft ? kKvInt8 : kKvHybrid;
+                k.k = pattern(k.cells * k.heads * k.head_dim, uint8_t(51 + layer));
+                k.v = pattern(k.cells * k.heads * (draft ? k.head_dim : kv_q4_bytes_per_head((int) k.head_dim)),
+                              uint8_t(61 + layer));
+                k.k_scale = pattern(k.cells * k.heads * (k.head_dim / 64) * sizeof(uint16_t), uint8_t(71 + layer));
+                k.v_scale = pattern(draft ? k.k_scale.size() : 0, uint8_t(81 + layer));
+            }
+        }
+        check(std::equal(producer.live.ids.begin(), producer.live.ids.end(), request.ids.begin()),
+              "prefill: synthetic producer holds exactly [0,n-1)");
+        SavedConversation meta = producer;
+        meta.kv.clear();
+        std::vector<SessionKvSource> sources;
+        for (const auto& k : producer.kv) {
+            SessionKvSource source;
+            source.format = k.format; source.cells = k.cells; source.heads = k.heads; source.head_dim = k.head_dim;
+            source.page_size = k.page_size; source.pooled_rows = k.pooled_rows; source.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t part = 0; part < parts.size(); ++part) source.sizes[part] = parts[part]->size();
+            source.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+                return parts[part]->read(dst, offset, n);
+            };
+            sources.push_back(std::move(source));
+        }
+        RequestPublication gate;
+        const uint64_t generation = gate.begin();
+        SessionWriteOptions options;
+        options.prefill = SessionPrefillBoundary{request.ids.size() - 1, (int32_t) request.ids.back()};
+        options.publication = [&](const std::function<bool()>& publish, std::string& why) {
+            return gate.publish(generation, publish, why);
+        };
+        SessionStatus status;
+        check(session_file_write(path.string(), meta, sources, identity, written, error, options, &status) && status.published,
+              "prefill: real streamed session producer commits and publishes v2");
+        gate.cancel();
+        check(status.published, "prefill: STOP after publication cannot retroactively cancel its receipt");
+        const auto committed = slurp(path);
+        // Optional test receipt for executing the actual older reader against this producer's v2 bytes.
+        if (const char* artifact = std::getenv("STRATA_TEST_PREFILL_ARTIFACT")) spit(fs::path(reinterpret_cast<const char8_t*>(artifact)), committed);
+        uint32_t version = 0;
+        std::memcpy(&version, committed.data() + 8, sizeof(version));
+        check(version == 2, "prefill: boundary extension is explicitly versioned, not a forged v1 identity");
+        SessionReadLimits limits;
+        PrefillRequest consumer_request;
+        check(parse_prefill_request("RESTORE_PREFILL 11,29,11,0,41,17 " + path.string(), consumer_request, error),
+              "prefill: real typed consumer command");
+        limits.prefill_prompt = consumer_request.ids;
+        SavedConversation consumer;
+        check(session_file_read(path.string(), identity, consumer, read, error, limits) && read == written &&
+              same(producer, consumer), "prefill: every GDN/conv, PLE, indexer and main/draft K/V part survives");
+        check(rejects(path, identity, "exact coordinator prompt"), "prefill: ordinary RESTORE rejects v2");
+        for (size_t token = 0; token < request.ids.size(); ++token) {
+            auto mismatch = limits;
+            (*mismatch.prefill_prompt)[token] ^= 1;
+            check(rejects(path, identity, token + 1 == request.ids.size() ? "boundary" : "prefix", mismatch),
+                  "prefill: changing any full coordinator token rejects before destination mutation");
+        }
+        auto permuted = limits;
+        std::swap((*permuted.prefill_prompt)[0], (*permuted.prefill_prompt)[1]);
+        check(rejects(path, identity, "prefix", permuted), "prefill: token multiset is not ordered identity");
+        check(rejects(path, {identity.model + 1, identity.config}, "model", limits), "prefill: real model check retained");
+        check(rejects(path, {identity.model, identity.config + 1}, "config", limits), "prefill: real config check retained");
+        check(rejects(dir / "missing-prefill.bin", identity, nullptr, limits), "prefill: missing artifact leaves destination unchanged");
+        for (const std::pair<size_t, uint64_t>& field : {std::pair<size_t, uint64_t>{40, 0}, {40, 9}, {48, UINT64_MAX}}) {
+            auto malformed = committed;
+            std::memcpy(malformed.data() + field.first, &field.second, sizeof(field.second));
+            const uint64_t hash = session_hash64(malformed.data(), 56, 0);
+            std::memcpy(malformed.data() + 56, &hash, sizeof(hash));
+            spit(path, malformed);
+            check(rejects(path, identity, nullptr, limits), "prefill: malformed boundary with valid header checksum rejected");
+        }
+        for (uint32_t incompatible : {uint32_t(1), uint32_t(3)}) {
+            auto malformed = committed;
+            std::memcpy(malformed.data() + 8, &incompatible, sizeof(incompatible));
+            const uint64_t hash = session_hash64(malformed.data(), 56, 0);
+            std::memcpy(malformed.data() + 56, &hash, sizeof(hash));
+            spit(path, malformed);
+            check(rejects(path, identity, incompatible == 1 ? "header" : "unsupported version", limits),
+                  "prefill: v1 reserved-field smuggling and unknown versions refused");
+        }
+        spit(path, committed);
+        // Cancel before the write, while bytes move, and after flush just before rename: all preserve old bytes.
+        for (int cancel_at : {0, 1, 2, 3}) {
+            const uint64_t owner = gate.begin();
+            options.publication = [&](const std::function<bool()>& publish, std::string& why) {
+                return gate.publish(owner, publish, why);
+            };
+            if (cancel_at == 0) gate.cancel();
+            options.progress = [&](uint64_t done, uint64_t) { if (cancel_at == 1 && done > 0) gate.cancel(); };
+            options.phase = [&](const char* phase, uint64_t) {
+                if (cancel_at == 2 && std::string(phase) == "publish") gate.cancel();
+                if (cancel_at == 3 && std::string(phase) == "publish") gate.begin();
+            };
+            check(!session_file_write(path.string(), meta, sources, identity, written, error, options, &status) &&
+                  !status.published && error.find("cancelled or superseded") != std::string::npos,
+                  "prefill: cancelled or stale producer cannot invoke rename");
+            check(slurp(path) == committed && no_temp(dir), "prefill: failed publication preserves prior artifact and cleans temp");
+        }
+        options.progress = {}; options.phase = {}; options.publication = {};
+        options.prefill->prefix_tokens++;
+        check(!session_file_write(path.string(), meta, sources, identity, written, error, options, &status) &&
+              !status.published && slurp(path) == committed, "prefill: writer rejects incorrect prefix extent");
+        options.prefill->prefix_tokens--;
+        options.prefill->final_token = -1;
+        check(!session_file_write(path.string(), meta, sources, identity, written, error, options, &status) &&
+              !status.published && slurp(path) == committed, "prefill: writer rejects invalid retained token");
+        options.prefill.reset();
+        check(session_file_write(path.string(), producer, identity, written, error, options), "prefill: ordinary SAVE remains v1");
+        if (const char* artifact = std::getenv("STRATA_TEST_SESSION_ARTIFACT")) spit(fs::path(reinterpret_cast<const char8_t*>(artifact)), slurp(path));
+        check(rejects(path, identity, "exact coordinator prompt", limits), "prefill: ordinary v1 file cannot pretend to be prefill");
+    }
 }
 } // namespace
 
@@ -161,6 +474,8 @@ int main() try {
     const SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
     const SavedConversation original = sample();
     const fs::path good = dir / "good.bin";
+    staged_handoff(dir);
+    prefill_handoff(dir);
 
     // round trip
     size_t written = 0;
@@ -248,7 +563,7 @@ int main() try {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -384,6 +699,12 @@ int main() try {
         check(differs([](SessionConfig& d) { d.rope.factor = std::nextafter(1.0, 2.0); }),
               "a one-ulp rope change enters the config");
         check(differs([](SessionConfig& d) { d.rope.type = 2; }), "rope type enters the config");
+        check(differs([](SessionConfig& d) { d.rope.freq_base = 1e6; }), "rope base enters the config");
+        check(differs([](SessionConfig& d) { d.rope.freq_scale = 2; }), "rope frequency scale enters the config");
+        check(differs([](SessionConfig& d) { d.rope.orig_ctx = 131072; }), "rope original context enters the config");
+        check(differs([](SessionConfig& d) { d.rope.ext_factor = 1; }), "rope extrapolation enters the config");
+        check(differs([](SessionConfig& d) { d.rope.attn_factor = 2; }), "rope attention factor enters the config");
+        check(differs([](SessionConfig& d) { d.rope.beta_fast = 16; }), "rope fast beta enters the config");
         check(differs([](SessionConfig& d) { d.rope.beta_slow = 2; }), "rope beta enters the config");
         check(differs([](SessionConfig& d) { d.cvec = 7; }), "control vectors enter the config");
         check(differs([](SessionConfig& d) { d.switches[0].second = 1; }), "a switch value enters the config");
@@ -417,6 +738,8 @@ int main() try {
         l.admit = [&](uint64_t, std::string&) { admitted = true; return true; };
         check(rejects(good, {id.model ^ 1, id.config}, "model", l) && !admitted,
               "admission is not asked for a foreign file");
+        check(rejects(good, {id.model, id.config ^ 1}, "config", l) && !admitted,
+              "admission is not asked for an incompatible configuration");
         SavedConversation back;
         size_t n = 0;
         check(session_file_read(good.string(), id, back, n, error, l) && admitted && same(back, original),

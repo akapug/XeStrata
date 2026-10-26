@@ -63,7 +63,7 @@ constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_mu
 constexpr int kF32 = 0;
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (!strata::gpu::alloc_host(h, bytes)) return false;
+    if (!strata::gpu::alloc_host(h, bytes, "plain-model")) return false;
     std::memset(*h, 0, bytes);
     return strata::gpu::device_pointer(d, *h);
 }
@@ -669,7 +669,7 @@ bool PlainModel::open_experts(std::string& err) {
         uint64_t db = 0, hb = 0;
         for (; opt_.prompt_chunk >= 16; opt_.prompt_chunk /= 2) {
             prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
-            if (strata::gpu::alloc_host(&prompt_host_, hb)) break;
+            if (strata::gpu::alloc_host(&prompt_host_, hb, "prompt-host")) break;
             prompt_host_ = nullptr;
         }
         if (prompt_host_ == nullptr) {
@@ -727,7 +727,7 @@ bool PlainModel::open_experts(std::string& err) {
     }
     res_.assign((size_t) (L * E), -1);
     heat_.assign((size_t) (L * E), 0.0);
-    if (!strata::gpu::alloc_host(&fill_tmp_, (size_t) lay.max_blob)) {
+    if (!strata::gpu::alloc_host(&fill_tmp_, (size_t) lay.max_blob, "fill-staging")) {
         err = "plain model: pinned staging for the slot fills";
         return false;
     }

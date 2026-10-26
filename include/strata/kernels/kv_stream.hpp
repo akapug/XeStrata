@@ -92,6 +92,19 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
 
+/// BATCH WINDOWS (STRATA_BATCH_QSA_ROWS): row r of a window, in its own slot's streamed state.  Every row's map is
+/// its own (no two rows share a slot), so the rows resolve independently.
+struct KvResolveSlots {
+    KvStreamMap map[kQsaSlotsMax];
+    QsaAttnPools slots[kQsaSlotsMax];
+    KvHostPools host[kQsaSlotsMax];
+};
+/// kv_stream_resolve for `n_rows` rows in two launches (the resolve, a work-group a row; the copy of every row's
+/// misses) instead of two a row: row r's selection at ids + r * cap, its steps at steps + r * kStepCount.  Row r's
+/// map, slots and copy are its one-row call's (bitwise).  Capturable; every row one format `fmt`.
+void kv_stream_resolve_slots(const KvResolveSlots& tab, int fmt, const int32_t* ids, const int32_t* steps, int n_rows,
+                             int64_t cap, const QsaShapes& s, void* stream);
+
 /// The static ring table `block -> block % n_slots`.
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);
 

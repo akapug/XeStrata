@@ -140,7 +140,7 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             s.issued = false;
         }
     }
-    if (relay_ == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_, max_bytes_), "the relay");
+    if (relay_ == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_, max_bytes_, "image-relay"), "the relay");
     if (relay_free_ == nullptr) {
         check(gpu::event_create(&relay_free_), "an event");
         check(gpu::event_record(relay_free_, copy_), "an event");

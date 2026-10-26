@@ -38,7 +38,7 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (!strata::gpu::alloc_host(h, bytes)) return false;
+    if (!strata::gpu::alloc_host(h, bytes, "moe-window")) return false;
     std::memset(*h, 0, bytes);
     return strata::gpu::device_pointer(d, *h);
 }

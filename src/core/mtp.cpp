@@ -72,7 +72,7 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (!strata::gpu::alloc_host(h, bytes)) return false;
+    if (!strata::gpu::alloc_host(h, bytes, "mtp")) return false;
     std::memset(*h, 0, bytes);
     return strata::gpu::device_pointer(d, *h);
 }
@@ -990,7 +990,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             if (pf_host_) strata::gpu::free(pf_host_);
             pf_host_ = nullptr;
             pf_host_cap_ = 0;
-            if (strata::gpu::alloc_host(&pf_host_, (size_t) need * sizeof(int32_t))) pf_host_cap_ = need;
+            if (strata::gpu::alloc_host(&pf_host_, (size_t) need * sizeof(int32_t), "mtp")) pf_host_cap_ = need;
             else pf_host_ = nullptr;
         }
         if (pf_host_ != nullptr && pf_ev_ == nullptr && !strata::gpu::event_create(&pf_ev_)) pf_ev_ = nullptr;

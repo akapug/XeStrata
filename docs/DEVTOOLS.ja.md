@@ -286,7 +286,11 @@ sde64 -version
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
-- `STRATA_VERIFY_PROFILE=1` はデバイス全体で共通の時計を必要とし、B70 にはそれがありません。
+- `STRATA_VERIFY_PROFILE=1` は窓の各段の GPU 時間を出します。
+  時計は `STRATA_VERIFY_PROFILE_CLOCK`（`device`、`sub_group`、`work_group`。既定は `device`）で選び、デバイスにないときはその順で最初にあるものを使います。
+  B70 にあるのはサブグループの時計だけです。この時計は GPU コアのサイクルを数えるので、刻みの速さは GPU の周波数で変わります。報告は窓ごとに測った速さで ms に直します。
+  GPU が約 10 ms 休むと時計は 0 から数え直しますが、窓の中にそれほどの隙間はありません。
+  `tools/clock_probe.cpp` はデバイスの時計を測ります。
 
 ### xe ドライバーのカーネルのログ
 

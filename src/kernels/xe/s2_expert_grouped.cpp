@@ -241,7 +241,7 @@ constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row pe
 constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
 // a group holds one entry per token of the window routed to its expert, and the kernels below keep at most GMAX of
 // them: a longer window would drop entries without a word (upstream 64cfe3c)
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+// Wider windows iterate uniform GMAX-entry passes; local-memory footprint stays unchanged.
 constexpr int GU_ROWS = 32;                      // gate/up rows per work-group: 4 per sub-group
 constexpr int D_ROWS = 64;                       // down rows per work-group: 8 per sub-group
 
@@ -419,7 +419,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             const sycl::sub_group sg = it.get_sub_group();
             const int g = (int) it.get_group(0);
             if (g >= *n_groups) return;   // uniform
-            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            for (int e0 = grp_start[g]; e0 < grp_start[g + 1]; e0 += GMAX) {
+            const int ne = sycl::min(grp_start[g + 1] - e0, GMAX);
             const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
             for (int i = t; i < ne * (H / 32); i += 256) {
                 const int k = i / (H / 32), c = i - k * (H / 32);
@@ -465,6 +466,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                     }
                 }
             }
+            sycl::group_barrier(it.get_group());
+            }
         });
     });
     void* s = &q;
@@ -483,7 +486,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             const sycl::sub_group sg = it.get_sub_group();
             const int g = (int) it.get_group(0);
             if (g >= *n_groups) return;
-            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            for (int e0 = grp_start[g]; e0 < grp_start[g + 1]; e0 += GMAX) {
+            const int ne = sycl::min(grp_start[g + 1] - e0, GMAX);
             const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
             for (int i = t; i < ne * (FF / 32); i += 256) {
                 const int k = i / (FF / 32), c = i - k * (FF / 32);
@@ -520,6 +524,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                     const float sum = warp_sum(sg, acc);
                     if (lane == 0) out[(size_t) ent_dst[e0 + k] * H + r] = sum;
                 }
+            }
+            sycl::group_barrier(it.get_group());
             }
         });
     });

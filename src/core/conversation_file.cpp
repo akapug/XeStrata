@@ -48,7 +48,7 @@ namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 1, kPrefillVersion = 2;
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -804,15 +804,21 @@ bool has_stage_parts(const SavedConversation& s) {
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload,
+                  const std::optional<SessionPrefillBoundary>& prefill) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t version = prefill ? kPrefillVersion : kVersion, size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    if (prefill) {
+        const uint64_t final_token = (uint64_t) prefill->final_token;
+        std::memcpy(h + 40, &prefill->prefix_tokens, 8);
+        std::memcpy(h + 48, &final_token, 8);
+    }
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
@@ -1033,6 +1039,12 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (opt.prefill && (opt.prefill->prefix_tokens == 0 || opt.prefill->prefix_tokens != image.live.ids.size() ||
+        opt.prefill->final_token < 0 || !image.live.imgs.empty() ||
+        std::any_of(image.live.ids.begin(), image.live.ids.end(), [](int32_t t) { return t < 0; }))) {
+        error = "session file: invalid prefill boundary";
+        return false;
+    }
     Out sizing;
     put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
@@ -1071,7 +1083,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, opt.prefill);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1091,7 +1103,8 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         st.error = out.read_failed ? SessionError::io : f.kind();
     } else {
         if (opt.phase) opt.phase("publish", total);
-        if (pub.publish(why, opt.durable, st, fault)) {
+        const auto publish = [&] { return pub.publish(why, opt.durable, st, fault); };
+        if (opt.publication ? opt.publication(publish, why) : publish()) {
             st.error = SessionError::none;
             bytes = (size_t) total;
             return true;
@@ -1206,8 +1219,23 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (version != kVersion && version != kPrefillVersion) {
+        error = "session file: unsupported version " + std::to_string(version); return false;
+    }
+    if (hsize != kHeader || (version == kVersion && (r0 || r1)) ||
+        (version == kPrefillVersion && (r0 == 0 || r1 > INT32_MAX))) {
+        error = "session file: invalid header fields"; return false;
+    }
+    if ((version == kPrefillVersion) != bool(limits.prefill_prompt)) {
+        error = "session file: prefill artifact requires the exact coordinator prompt"; return false;
+    }
+    if (limits.prefill_prompt) {
+        const auto& prompt = *limits.prefill_prompt;
+        if (prompt.size() < 2 || r0 != prompt.size() - 1 || prompt.back() != (int64_t) r1 ||
+            std::any_of(prompt.begin(), prompt.end(), [](int64_t t) { return t < 0 || t > INT32_MAX; })) {
+            error = "session file: prefill final-token boundary differs"; return false;
+        }
+    }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
@@ -1233,6 +1261,10 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (limits.prefill_prompt && (parsed.live.ids.size() != r0 || !parsed.live.imgs.empty() ||
+        !std::equal(parsed.live.ids.begin(), parsed.live.ids.end(), limits.prefill_prompt->begin()))) {
+        error = "session file: prefill ordered token prefix differs"; return false;
+    }
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;

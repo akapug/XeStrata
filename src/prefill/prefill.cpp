@@ -102,7 +102,7 @@ public:
     void resize(size_t n) {
         if (n > cap_) {
             release();
-            if (!force_pageable() && strata::gpu::alloc_host(&pinned_, n * sizeof(T))) cap_ = n;
+            if (!force_pageable() && strata::gpu::alloc_host(&pinned_, n * sizeof(T), "prefill")) cap_ = n;
             else { pinned_ = nullptr; fallback_.resize(n); cap_ = n; }
         }
         n_ = n;
@@ -298,7 +298,7 @@ struct Stager {
         dma_done.assign((size_t) kRing, nullptr);
         pageable.resize(kRing);
         for (int i = 0; i < kRing; ++i) {
-            pinned[i] = (char) (!force_pageable() && strata::gpu::alloc_host((void**) &buf[i], blob_bytes));
+            pinned[i] = (char) (!force_pageable() && strata::gpu::alloc_host((void**) &buf[i], blob_bytes, "prefill-stager"));
             if (!pinned[i]) {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
@@ -424,7 +424,7 @@ struct PinnedUpload {
             if (ev && !strata::gpu::event_sync(ev)) return;   // keep the old buffer: begin() then falls back
             release();
         }
-        if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t))) {
+        if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t), "prefill")) {
             p = nullptr;
             return;
         }
@@ -743,8 +743,8 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
                 strata::gpu::alloc_device(&hs->hq, mmq::q8_bytes(cap, ff) * 2) &&
                 strata::gpu::alloc_device(&hs->meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
                 strata::gpu::alloc_device(&hs->wtab, (size_t) cap * sizeof(void*)) &&
-                strata::gpu::alloc_host(&hs->h_meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
-                strata::gpu::alloc_host(&hs->h_wtab, (size_t) cap * sizeof(void*));
+                strata::gpu::alloc_host(&hs->h_meta, (size_t) (3 * cap + 1) * sizeof(int32_t), "prefill-helper") &&
+                strata::gpu::alloc_host(&hs->h_wtab, (size_t) cap * sizeof(void*), "prefill-helper");
             if (!ok) { err = std::string("the helper GPU's buffers: ") + strata::gpu::last_error(); return false; }
             for (int64_t i = 0; i < cap; ++i) hs->h_meta[2 * cap + 1 + i] = (int32_t) i;   // the identity
         }
@@ -1100,7 +1100,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
+        if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4, "prefill-split-handoff")) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
@@ -1171,7 +1171,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
-            (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4))) {
+            (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4, "prefill-ple"))) {
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
         }
@@ -2361,7 +2361,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (m.cpu_x) strata::gpu::free(m.cpu_x);
                             m.cpu_x = nullptr;
                             m.cpu_x_n = 0;
-                            if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float))) {
+                            if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float), "prefill-cpu-share")) {
                                 m.cpu_x = nullptr;
                                 cpu_share_off("the activation buffer");
                             } else {
@@ -2390,7 +2390,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
                             m.cpu_rows = nullptr;
                             m.cpu_rows_n = 0;
-                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float))) {
+                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float), "prefill-cpu-share")) {
                                 m.cpu_rows = nullptr;
                                 cpu_share_off("the rows buffer");
                             } else {

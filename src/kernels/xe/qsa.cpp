@@ -18,6 +18,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "param_table.hpp"
 
 #include <cfloat>
 #include <cmath>
@@ -163,6 +164,39 @@ void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tab
         }
     });
     finish(stream, e, "kv_append_steps");
+}
+
+void kv_append_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, const float* kcur,
+                     const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream) {
+    validate(s, "kv_append_slots");
+    if (step == nullptr || n_tok < 0 || n_tok > kQsaSlotsMax) fail("kv_append_slots: step is null or n_tok out of range");
+    if (n_tok == 0) return;
+    for (int j = 0; j < n_tok; ++j)
+        if (!tab.k[j] || !tab.v[j] || !tab.page_table[j] || (tab.host_k[j] && !tab.host_v[j]))
+            fail("kv_append_slots: a row's pools are missing");
+    const long long per = s.n_head_kv * s.head_dim, n = per * n_tok;
+    const int head_dim = (int) s.head_dim, kv_heads = (int) s.n_head_kv, page_size = (int) s.page_size;
+    const KvAppendSlots* t_ = xe::device_table(queue_for(stream), tab);   // by pointer (param_table.hpp)
+    // kv_append_steps' arithmetic, token t into its own row's pools
+    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(grid_for(n, THREADS), THREADS), xe::fits("kv_append_slots", [=](sycl::nd_item<1> it) {
+        const long long g = (long long) it.get_global_id(0);
+        if (g >= n) return;
+        const int t = (int) (g / per), i = (int) (g - (long long) t * per);
+        const long long pos = (long long) step[(long long) t * step_stride + kStepPos];
+        const int h = i / head_dim, d = i - h * head_dim;
+        const long long page = (long long) t_->page_table[t][pos / page_size];
+        if (page >= 0) {
+            const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+            static_cast<uint16_t*>(t_->k[t])[row * head_dim + d] = f16_from_f32(kcur[(long long) t * cur_stride + i]);
+            static_cast<uint16_t*>(t_->v[t])[row * head_dim + d] = f16_from_f32(vcur[(long long) t * cur_stride + i]);
+        }
+        if (t_->host_k[t] != nullptr) {
+            const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+            static_cast<uint16_t*>(t_->host_k[t])[row * head_dim + d] = f16_from_f32(kcur[(long long) t * cur_stride + i]);
+            static_cast<uint16_t*>(t_->host_v[t])[row * head_dim + d] = f16_from_f32(vcur[(long long) t * cur_stride + i]);
+        }
+    }));
+    finish(stream, e, "kv_append_slots");
 }
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
