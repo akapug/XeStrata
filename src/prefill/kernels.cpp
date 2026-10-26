@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/gdn_chunk.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -585,6 +586,103 @@ struct Gdn {
         });
     }
 
+    // Portable FP32 chunk-WY backend, opt-in only. A group owns one value
+    // head and all of its columns: factors are shared, state/delta private.
+    // It is not an XMX kernel or a measured acceleration. The shared algebra's
+    // factor() boundary can later take a matrix-engine implementation without
+    // changing the solve, carry, layouts, or the existing output epilogue.
+    template <int Chunk> struct GdnRecChunk {
+        float* state;
+        const float* h;
+        const float* gate;
+        const float* beta;
+        float* y;
+        int64_t T;
+        sycl::local_accessor<float, 1> ab, lower, coeff;
+
+        void operator()(sycl::nd_item<1> it) const {
+            using W = GdnChunk<Chunk, S>;
+            const int head = (int) it.get_group(0), col = (int) it.get_local_id(0), kh = head % HK;
+            const size_t rs = (size_t) HV * S;
+            float* base = state + (size_t) head * S + col;
+            float st[S];
+            for (int r = 0; r < S; ++r) st[r] = base[(size_t) r * rs];
+            const auto fma = [](float a, float b, float c) { return sycl::fma(a, b, c); };
+            for (int64_t t = 0; t < T; t += Chunk) {
+                const int n = (int) (T - t < Chunk ? T - t : Chunk);
+                const float* q = h + t * C + kh * S;
+                const float* k = q + HK * S;
+                if (col < n) {
+                    ab[col] = sycl::exp(gate[(t + col) * HV + head]);
+                    ab[Chunk + col] = beta[(t + col) * HV + head];
+                }
+                sycl::group_barrier(it.get_group());
+                for (int at = col; at < n * n; at += S)
+                    W::factor(at / n, at % n, q, k, &ab[0], &ab[Chunk], &lower[0], &coeff[0], fma, C);
+                sycl::group_barrier(it.get_group());
+                float d[Chunk];
+                for (int i = 0; i < n; ++i) {
+                    const float v = h[(t + i) * C + 2 * HK * S + head * S + col];
+                    d[i] = W::delta(i, k, &ab[0], &ab[Chunk], &lower[0], v, st, d, fma, C);
+                    y[(t + i) * HV * S + (size_t) head * S + col] =
+                        W::output(i, q, &ab[0], &coeff[0], st, d, fma, C) * sycl::rsqrt((float) S);
+                }
+                for (int r = 0; r < S; ++r) st[r] = W::carry(r, n, k, &ab[0], st[r], d, fma, C);
+                // No group may overwrite factors while another column still
+                // reads them; tails never access the unused rows or entries.
+                sycl::group_barrier(it.get_group());
+            }
+            for (int r = 0; r < S; ++r) base[(size_t) r * rs] = st[r];
+        }
+    };
+
+    template <int Chunk> static bool chunk_builds(sycl::queue& q) {
+        const auto id = sycl::get_kernel_id<GdnRecChunk<Chunk>>();
+        const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {q.get_device()}, {id});
+        return bundle.get_kernel(id).template get_info<sycl::info::kernel_device_specific::work_group_size>(q.get_device()) >= S;
+    }
+
+    static int chunk_size(sycl::queue& q) {
+        // The explicit legacy-heads experiment still wins. Unset means no
+        // new device query, kernel build, log, allocation or host wait.
+        const char* value = std::getenv("STRATA_GDN_CHUNK");
+        if (value == nullptr || gdn_chunk_request(value) == 0 || std::getenv("STRATA_GDN_REC_HEADS") != nullptr) return 0;
+        static core::PerDevice<int> per_device;
+        return per_device.get(q.get_device(), [&] {
+            const int chunk = gdn_chunk_request(value);
+            const auto device = q.get_device();
+            if (!gdn_chunk_fits(chunk, S, device.get_info<sycl::info::device::local_mem_size>(),
+                                device.get_info<sycl::info::device::max_work_group_size>()) ||
+                device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0] < S) {
+                std::fprintf(stderr, "strata: GDN chunk %d exceeds device local-memory/work-group limits; legacy recurrence\n", chunk);
+                return 0;
+            }
+            try {
+                const bool builds = chunk == 16 ? chunk_builds<16>(q) : chunk == 32 ? chunk_builds<32>(q) : chunk_builds<GDN_CHUNK_DEFAULT>(q);
+                if (builds) {
+                    std::fprintf(stderr, "strata: GDN portable FP32 chunk-WY %d (%d/%d heads, %zu local bytes); GPU parity/speed unqualified\n",
+                                 chunk, HK, HV, gdn_chunk_local_bytes(chunk, S));
+                    return chunk;
+                }
+            } catch (const sycl::exception& e) {
+                std::fprintf(stderr, "strata: GDN chunk kernel unavailable (%s); legacy recurrence\n", e.what());
+                return 0;
+            }
+            std::fprintf(stderr, "strata: GDN chunk kernel work-group limit is too small; legacy recurrence\n");
+            return 0;
+        });
+    }
+
+    template <int Chunk> static void launch_chunk(sycl::queue& q, float* state, const float* h, const float* gate,
+                                                  const float* beta, float* y, int64_t T) {
+        q.submit([&](sycl::handler& hd) {
+            using L = sycl::local_accessor<float, 1>;
+            hd.parallel_for(sycl::nd_range<1>((size_t) HV * S, S),
+                            GdnRecChunk<Chunk>{state, h, gate, beta, y, T, L(sycl::range<1>(2 * Chunk), hd),
+                                               L(sycl::range<1>(Chunk * Chunk), hd), L(sycl::range<1>(Chunk * Chunk), hd)});
+        });
+    }
+
     // The recurrence with one value column a work-item and all S rows of its state in registers (the large register
     // file): no barrier, no local memory, q and k read once per sub-group and handed out by sub-group broadcasts.  Per
     // column the same arithmetic in the same order as the D-2 kernel below (four row groups of S / 4, summed left to
@@ -952,7 +1050,11 @@ struct Gdn {
         // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
         // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
         static int pick = -1;   // 1: the key-head form
-        if (gdn_lane_ok(q))
+        const int chunk = chunk_size(q);
+        if (chunk == 16) launch_chunk<16>(q, state, h, gate, beta, y, T);
+        else if (chunk == 32) launch_chunk<32>(q, state, h, gate, beta, y, T);
+        else if (chunk == GDN_CHUNK_DEFAULT) launch_chunk<GDN_CHUNK_DEFAULT>(q, state, h, gate, beta, y, T);
+        else if (gdn_lane_ok(q))
             q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
         else {
             if (pick < 0 && kh_on && T >= 64) {
@@ -1030,6 +1132,12 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     });
 }
 
+int gdn_recurrence_chunk_size(void* stream, int64_t h_k, int64_t h_v) {
+    int chunk = 0;
+    gdn_dispatch(h_k, h_v, "gdn_recurrence_chunk_size", [&](auto g) { chunk = decltype(g)::chunk_size(Q(stream)); });
+    return chunk;
+}
+
 // ---------------------------------------------------------------- MoE
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512) route_launch<16>(Q(stream), logits, ids, weights, T);
@@ -1088,6 +1196,52 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
         float s = 0.0f;
         for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
         bo[i] = s + shared[i] * sigm(sg[t]);
+    });
+}
+
+void moe_combine_gr_write_norm_rs(const float* Dm, const int32_t* slot, const float* weights, const float* shared,
+                                  const float* sg, float* R, const float* inj, int64_t inj_ld, const float* w,
+                                  float eps, float* rs_out, uint16_t* xn16, int64_t T, void* stream,
+                                  uint16_t* xn16_lo) {
+    if (T <= 0) return;
+    constexpr int PER = (N + 255) / 256;
+    Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) T * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int64_t t = (int64_t) it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            float bo[PER];
+            int j = 0;
+            for (int d = tid; d < N; d += 256, ++j) {
+                float s = 0.0f;
+                for (int k = 0; k < 10; ++k)
+                    s = sycl::fma(weights[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+                bo[j] = s + shared[t * N + d] * sigm(sg[t]);
+            }
+            for (int c = 0; c < HC; ++c) {
+                const int64_t row = t * HC + c;
+                float* r = R + row * N;
+                const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+                float v[PER];
+                float ss = 0.0f;
+                j = 0;
+                for (int d = tid; d < N; d += 256, ++j) {
+                    const float x = sycl::fma(bo[j], sc, r[d]);
+                    r[d] = x;
+                    v[j] = x;
+                    ss += x * x;
+                }
+                const float rs = sycl::rsqrt(block_sum(it, ss, &sh[0]) / (float) N + eps);
+                if (tid == 0) rs_out[row] = rs;
+                j = 0;
+                for (int d = tid; d < N; d += 256, ++j) {
+                    const float x = v[j] * rs * w[c * N + d];
+                    const uint16_t hi = bf(x);
+                    xn16[row * N + d] = hi;
+                    if (xn16_lo) xn16_lo[row * N + d] = bf_lo(x, hi);
+                }
+            }
+        });
     });
 }
 

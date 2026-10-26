@@ -18,10 +18,12 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/runtime.hpp"
+#include "strata/core/homelab_profile.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
+#include "strata/core/conversation_park_queue.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/session_save_reclaim.hpp"
@@ -60,6 +62,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/share_rules.hpp"
+#include "strata/core/slot_fill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -68,11 +71,16 @@
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/window_prefill.hpp"
+#include "strata/program/shared_prefix.hpp"
+#include "strata/program/read_pipe.hpp"
+#include "strata/program/slot_park.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/stream_cpu.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
@@ -238,6 +246,10 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     swaps.swap(kept);
     return true;
 }
+
+struct Options;
+int64_t slot_cells(const Options& o, int64_t b);
+bool slot_borrows_rope();
 
 struct Options {
     std::string pack = "pack/full";
@@ -443,6 +455,11 @@ struct Options {
     int batch_groups = 1;
     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
     bool batch_groups_auto = false;   ///< --batch-groups auto: one group per stage of a layer split (dividing --batch)
+    /// Mixed slot contexts: the first `big_slots` batch slots hold --max-context cells, the others `slot_context`
+    /// (0: every slot holds --max-context).  The main session reads every prompt, so it keeps --max-context.  A main
+    /// agent's long conversation then fits one big slot while its subagents' shorter ones pin half the host KV each.
+    int64_t slot_context = 0;
+    int big_slots = 1;
     int batch_mtp = -1;          ///< one MTP proposal per batch slot: --batch-mtp 1, --no-batch-mtp 0, -1 = with --mtp
     /// EXPERIMENTAL, off by default: with --batch-groups over two GPUs, the CPU expert workers in two pools on separate
     /// cores (N0 for the first stage, N1 for the second), each stage's windows served by a host thread of its own, so
@@ -633,6 +650,8 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --slot-context N     --batch: slots past the first --big-slots hold N cells (default: --max-context)\n"
+                 "  --big-slots K        --batch: how many slots keep --max-context with --slot-context (default 1)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear (position\n"
                  "                       interpolation) or yarn - llama.cpp's types.  Default: the model file's\n"
                  "                       rope keys, else none.  Fixed at startup (K in the cache is post-RoPE)\n"
@@ -916,11 +935,17 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
+    homelab_profile::Span hp_dispatch("expert.dispatch", (int) layer);
+    const auto hp_hits = t->d.cache_hits, hp_misses = t->d.multi_misses, hp_pcie = t->d.pcie_experts;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    hp_dispatch.resident_lookups = t->d.cache_hits - hp_hits;
+    hp_dispatch.cpu_distinct_pairs = t->d.multi_misses - hp_misses;
+    hp_dispatch.pcie_distinct_experts = t->d.pcie_experts - hp_pcie;
+    hp_dispatch.end();
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
@@ -1429,6 +1454,167 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
+/// The cells batch slot `b` holds (--slot-context, --big-slots).
+// The batch slots read their device's main session RoPE table instead of carving one each (32 MiB a slot at 131K);
+// STRATA_SLOT_OWN_ROPE=1 gives every slot its own, as before.
+bool slot_borrows_rope() {
+    static const bool on = std::getenv("STRATA_SLOT_OWN_ROPE") == nullptr;
+    return on;
+}
+
+// homelab: a layer split's idle batch slots are prefix sources too (copy_from_slot reads every stage back).  Off by
+// default: unset or 0 keeps the single-GPU-only slot reuse.
+bool slot_split_reuse() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SLOT_SPLIT_REUSE");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+// homelab: a batch slot's admission (copy_to_slot) and a returning conversation's read-back (copy_from_slot) copy each
+// QSA layer's K/V session to session (conversation_kv_copy) instead of through a host image with a device sync per
+// layer.  Off by default: unset or 0 keeps the host-image copy.
+bool slot_direct_copy() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SLOT_DIRECT_COPY");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+// homelab: in --batch, the conversation the main session holds was copied into the slot it continued in (copy_to_slot),
+// so parking it (a whole snapshot to the host, ~116 ms measured on a tiny admission) only duplicates a slot that is
+// already a prefix source (STRATA_SLOT_SPLIT_REUSE under a layer split).  STRATA_PARK_SKIP_SLOT_HELD=1 skips the park
+// while another slot than the one this request takes still holds that conversation.  The trade: once the server gives
+// that slot to another request, the conversation is in neither place and its next turn reads again.  Off by default.
+bool park_skip_slot_held() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_SKIP_SLOT_HELD");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+// homelab slot park (kvib, slot_park.hpp): STRATA_SLOT_PARK, STRATA_SLOT_PARK_MIN_TOKENS, read once.  An invalid value
+// keeps the lever off, said once.
+const strata::program::slot_park::Settings& slot_park_settings() {
+    static const strata::program::slot_park::Settings s = [] {
+        strata::program::slot_park::Settings x;
+        std::string why;
+        if (!strata::program::slot_park::parse_settings(std::getenv("STRATA_SLOT_PARK"),
+                                                        std::getenv("STRATA_SLOT_PARK_MIN_TOKENS"), x, why))
+            std::fprintf(stderr, "strata: %s; the slot park is off\n", why.c_str());
+        return x;
+    }();
+    return s;
+}
+
+// homelab staged refill (slot_fill.hpp): STRATA_REFILL_STAGED, STRATA_REFILL_BUFFERS, STRATA_REFILL_THREADS, read once.
+// An invalid value keeps the lever off, said once.
+const strata::core::SlotFillSettings& slot_fill_settings() {
+    static const strata::core::SlotFillSettings s = [] {
+        strata::core::SlotFillSettings x;
+        std::string why;
+        if (!strata::core::parse_slot_fill_settings(std::getenv("STRATA_REFILL_STAGED"), std::getenv("STRATA_REFILL_BUFFERS"),
+                                                    std::getenv("STRATA_REFILL_THREADS"), x, why))
+            std::fprintf(stderr, "strata: %s; the staged refill is off\n", why.c_str());
+        else if (x.on)
+            std::fprintf(stderr, "strata: STRATA_REFILL_STAGED: lent slots refill through %d pinned buffers and %d copy "
+                                 "threads per GPU, the GPUs at once\n", x.buffers, x.threads);
+        return x;
+    }();
+    return s;
+}
+
+// homelab background park (conversation_park_queue.hpp): STRATA_SLOT_PARK_ASYNC, STRATA_SLOT_PARK_QUEUE,
+// STRATA_SLOT_PARK_QUEUE_MIB, read once.  An invalid value keeps the park on the serve thread, said once.
+const strata::program::slot_park::AsyncSettings& slot_park_async_settings() {
+    static const strata::program::slot_park::AsyncSettings s = [] {
+        strata::program::slot_park::AsyncSettings x;
+        std::string why;
+        if (!strata::program::slot_park::parse_async_settings(std::getenv("STRATA_SLOT_PARK_ASYNC"),
+                                                              std::getenv("STRATA_SLOT_PARK_QUEUE"),
+                                                              std::getenv("STRATA_SLOT_PARK_QUEUE_MIB"), x, why))
+            std::fprintf(stderr, "strata: %s; the slot park writes on the serve thread\n", why.c_str());
+        return x;
+    }();
+    return s;
+}
+
+// homelab window-row prefill (STRATA_BATCH_PREFILL, window_prefill.hpp): its settings, read once.  An invalid value keeps
+// the lever off, said once.
+const strata::program::window_prefill::Settings& window_prefill_settings() {
+    static const strata::program::window_prefill::Settings s = [] {
+        strata::program::window_prefill::Settings x;
+        std::string why;
+        if (!strata::program::window_prefill::parse_settings(
+                std::getenv("STRATA_BATCH_PREFILL"), std::getenv("STRATA_BATCH_PREFILL_MAX_TOKENS"),
+                std::getenv("STRATA_BATCH_PREFILL_ROWS"), std::getenv("STRATA_BATCH_PREFILL_SLOTS"),
+                std::getenv("STRATA_BATCH_PREFILL_SPLIT"), std::getenv("STRATA_BATCH_PREFILL_GRAPHS"),
+                strata::kernels::verify_max_t(), x, why)) {
+            std::fprintf(stderr, "strata serve: window-row prefill is off: %s\n", why.c_str());
+            x = strata::program::window_prefill::Settings{};
+        }
+        return x;
+    }();
+    return s;
+}
+
+// homelab shared-prefix reuse across slots (STRATA_SHARED_PREFIX, shared_prefix.hpp): its settings, read once.  An
+// invalid value keeps the lever off, said once.
+const strata::program::shared_prefix::Settings& shared_prefix_settings() {
+    static const strata::program::shared_prefix::Settings s = [] {
+        strata::program::shared_prefix::Settings x;
+        std::string why;
+        if (!strata::program::shared_prefix::parse_settings(
+                std::getenv("STRATA_SHARED_PREFIX"), std::getenv("STRATA_SHARED_PREFIX_MIN_TOKENS"),
+                std::getenv("STRATA_SHARED_PREFIX_ALIGN"), std::getenv("STRATA_SHARED_PREFIX_MAX"),
+                std::getenv("STRATA_SHARED_PREFIX_MAX_MIB"), x, why)) {
+            std::fprintf(stderr, "strata serve: shared-prefix reuse is off: %s\n", why.c_str());
+            x = strata::program::shared_prefix::Settings{};
+        }
+        return x;
+    }();
+    return s;
+}
+
+// homelab pipelined batch reads (STRATA_BATCH_READ_PIPE, read_pipe.hpp): its settings, read once.  An invalid value keeps
+// the lever off, said once.
+const strata::program::read_pipe::Settings& read_pipe_settings() {
+    static const strata::program::read_pipe::Settings s = [] {
+        strata::program::read_pipe::Settings x;
+        std::string why;
+        if (!strata::program::read_pipe::parse_settings(
+                std::getenv("STRATA_BATCH_READ_PIPE"), std::getenv("STRATA_BATCH_READ_PARTS"),
+                std::getenv("STRATA_BATCH_READ_CHUNK_MIN"), std::getenv("STRATA_BATCH_READ_GROUP"), x, why)) {
+            std::fprintf(stderr, "strata serve: pipelined batch reads are off: %s\n", why.c_str());
+            x = strata::program::read_pipe::Settings{};
+        }
+        return x;
+    }();
+    return s;
+}
+
+// STRATA_BATCH_PAD_KEEPS_IDLE (window_prefill::pad_row): an idle slot's row in a group window leaves its conversation
+bool pad_keeps_idle() {
+    static const bool on = [] {
+        bool x = strata::program::window_prefill::kPadKeepsIdleDefault;
+        std::string why;
+        if (!strata::program::window_prefill::parse_pad_keeps_idle(std::getenv("STRATA_BATCH_PAD_KEEPS_IDLE"), x, why)) {
+            std::fprintf(stderr, "strata serve: %s; the default (%d) stays\n", why.c_str(),
+                         (int) strata::program::window_prefill::kPadKeepsIdleDefault);
+            x = strata::program::window_prefill::kPadKeepsIdleDefault;
+        }
+        return x;
+    }();
+    return on;
+}
+
+int64_t slot_cells(const Options& o, int64_t b) {
+    return o.slot_context > 0 && b >= o.big_slots ? std::min(o.slot_context, o.max_context) : o.max_context;
+}
+
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
                           uint64_t& digest, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
@@ -2461,6 +2647,8 @@ int main(int argc, char** argv) {
             else o.batch_groups = (int) std::strtol(bgv, nullptr, 10);
         }
         else if (a == "--batch-mtp") o.batch_mtp = 1;
+        else if (a == "--slot-context") o.slot_context = std::strtoll(next(a.c_str()), nullptr, 10);
+        else if (a == "--big-slots") o.big_slots = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--no-batch-mtp") o.batch_mtp = 0;
         else if (a == "--batch-cpu-split") {
             const char* v = next(a.c_str());
@@ -2866,7 +3054,7 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        o.spec = std::min(o.spec + 2, strata::kernels::kVerifyDefaultT);   // MTP drafter capacity stays unchanged
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -2874,7 +3062,7 @@ int main(int argc, char** argv) {
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyMaxT
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, strata::kernels::kVerifyDefaultT));   // MTP stays unchanged
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -3357,8 +3545,9 @@ int main(int argc, char** argv) {
             const int64_t base_reserve =   // --vram-reserve-later-mib: the later cards' own reserve (upstream 5c4105c0)
                 i > 0 && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
             const int64_t reserve = (base_reserve + (i > 0 ? kWindowMib : kPipeSnapMib) + kPipeWindowMib) << 20;
-            const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
-                                 (1 + std::max(o.batch, 0));
+            int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi);
+            for (int b = 0; b < o.batch; ++b)
+                sess += (int64_t) strata::core::session_bytes(ga, slot_cells(o, b), Ka, lo, hi, !slot_borrows_rope());
             return free0[(size_t) ord[(size_t) i]] - reserve - (int64_t) weights_of(lo, hi) - sess -
                    prompt[(size_t) ord[(size_t) i]] -
                    (last ? (int64_t) head_bytes + drafter_bytes : 0);
@@ -4191,7 +4380,7 @@ int main(int argc, char** argv) {
         const size_t bytes = strata::core::conversation_checkpoint_staged_bytes(ss, g);
         if ((v == nullptr || std::strtol(v, nullptr, 10) != 0) && bytes > 0) {
             ckpt_stream = strata::gpu::stream_create();
-            if (ckpt_stream == nullptr || !strata::gpu::alloc_host(&ckpt_staging, bytes))
+            if (ckpt_stream == nullptr || !strata::gpu::alloc_host(&ckpt_staging, bytes, "ckpt-staging"))
                 ckpt_staging = nullptr;   // the copies to RAM as without it
         }
     }
@@ -4219,7 +4408,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
-        if (!strata::gpu::alloc_host((void**) &half_stage, n * sizeof(float))) {
+        if (!strata::gpu::alloc_host((void**) &half_stage, n * sizeof(float), "dump")) {
             std::fprintf(stderr, "strata generate: cannot pin the half-dump staging buffer\n");
             return 1;
         }
@@ -4573,7 +4762,7 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyDefaultT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
     }
@@ -4614,6 +4803,8 @@ int main(int argc, char** argv) {
     const int batch_asked = o.batch;
     auto drop_slots = [&](int keep, const char* beside, bool say) {
         if (keep < 2) keep = 0;
+        if (o.batch_groups > 1 && (keep == 0 || keep % o.batch_groups != 0)) o.batch_groups = 1;
+        if (!batch_mtp && o.batch_groups <= 1) keep = std::min(keep, strata::kernels::verify_max_t());
         strata::gpu::stream_sync(main_cs);
         while ((int) slot_mtp.size() > keep) slot_mtp.pop_back();
         while ((int) bslot_ss.size() > keep) {
@@ -4632,7 +4823,6 @@ int main(int argc, char** argv) {
         }
         o.batch = keep;
         if (keep == 0) batch_mtp = false;
-        if (o.batch_groups > 1 && (keep == 0 || keep % o.batch_groups != 0)) o.batch_groups = 1;
         if (!say) return;
         if (keep > 0)
             std::fprintf(stderr, "strata generate: --batch %d: %d slots run - more leave %s no VRAM on this GPU "
@@ -4645,21 +4835,27 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
                         : nullptr;
-        if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
+        const int row_cap = strata::kernels::verify_max_t();
+        const int group_cap = row_cap > strata::kernels::kVerifyDefaultT && !stages.empty() &&
+                              o.batch_groups_set && !o.batch_groups_auto && o.batch_groups > 1 &&
+                              o.batch % o.batch_groups == 0 ? o.batch_groups : 1;
+        const int64_t slot_cap = (int64_t) row_cap * group_cap;
+        if (o.batch > slot_cap && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
             std::fprintf(stderr, "strata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
-                         strata::kernels::kVerifyMaxT, strata::kernels::kVerifyMaxT);
-            o.batch = strata::kernels::kVerifyMaxT;
+                         row_cap, (int) slot_cap);
+            o.batch = (int) slot_cap;   // only reducing an int request, so this cast fits
         }
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --batch is off: %s\n", why);
             o.batch = 0;
         }
-        const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
         for (int b = 0; b < o.batch; ++b) {
+            const uint64_t bytes = strata::core::session_bytes(g, slot_cells(o, b), K, 0, hi0, !slot_borrows_rope());
             auto u = std::make_unique<strata::core::SessionState>();
             void* buf = nullptr;
             if (!strata::gpu::alloc_device(&buf, bytes) ||
-                strata::core::session_init(g, o.max_context, K, buf, *u, 0, hi0) == 0) {
+                strata::core::session_init(g, slot_cells(o, b), K, buf, *u, 0, hi0,
+                                           slot_borrows_rope() ? &ss : nullptr) == 0) {
                 if (buf) strata::gpu::free(buf);
                 std::fprintf(stderr, "strata generate: --batch: slot %d's session does not fit (%.2f GiB each)\n", b,
                              (double) bytes / 1073741824.0);
@@ -4675,12 +4871,15 @@ int main(int argc, char** argv) {
             GpuStage& st = *stp;
             const strata::core::OnDevice on(st.dev);
             // carved like the stage's own session (its layer range)
-            const uint64_t sbytes = strata::core::session_bytes(g, o.max_context, K, st.ss.layer_lo, st.ss.layer_hi);
             while (st.bslots.size() < bslot_ss.size()) {
+                const int64_t cells = slot_cells(o, (int64_t) st.bslots.size());
+                const uint64_t sbytes =
+                    strata::core::session_bytes(g, cells, K, st.ss.layer_lo, st.ss.layer_hi, !slot_borrows_rope());
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
                 if (!strata::gpu::alloc_device(&buf, sbytes) ||
-                    strata::core::session_init(g, o.max_context, K, buf, *u, st.ss.layer_lo, st.ss.layer_hi) == 0) {
+                    strata::core::session_init(g, cells, K, buf, *u, st.ss.layer_lo, st.ss.layer_hi,
+                                               slot_borrows_rope() ? &st.ss : nullptr) == 0) {
                     if (buf) strata::gpu::free(buf);
                     std::fprintf(stderr, "strata generate: --batch: CUDA%d holds %zu slot sessions\n", st.dev,
                                  st.bslots.size());
@@ -4745,12 +4944,24 @@ int main(int argc, char** argv) {
                 o.batch_groups = 1;
             }
         }
+        // Session fit may disable groups. Reapply serial capacity, and retire all
+        // stages' sessions when fewer than two primary slots fit.
+        if (o.batch == 0 || (!batch_mtp && o.batch_groups <= 1 && o.batch > strata::kernels::verify_max_t()))
+            drop_slots(o.batch, "the serial batch window", false);
         if (o.batch > 0) {
             strata::gpu::stream_sync(main_cs);
             size_t fb = 0, tb = 0;
             strata::gpu::mem_info(&fb, &tb);
-            std::fprintf(stderr, "strata generate: --batch: %d slot sessions (%.2f GiB each); %.2f GiB free\n", o.batch,
-                         (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+            const double big =
+                (double) strata::core::session_bytes(g, slot_cells(o, 0), K, 0, hi0, !slot_borrows_rope()) / 1073741824.0;
+            const double small = (double) strata::core::session_bytes(g, slot_cells(o, o.batch - 1), K, 0, hi0,
+                                                                      !slot_borrows_rope()) /
+                                  1073741824.0;
+            std::fprintf(stderr, "strata generate: --batch: %d slot sessions (%.2f GiB each, %.2f past --big-slots); "
+                                 "%.2f GiB free\n", o.batch, big, small, (double) fb / 1073741824.0);
+            std::fprintf(stderr, "strata generate: --batch: a slot session holds %s\n",
+                         strata::core::session_bytes_report(g, slot_cells(o, o.batch - 1), K, 0, hi0,
+                                                            !slot_borrows_rope()).c_str());
         }
     }
 
@@ -4809,6 +5020,8 @@ int main(int argc, char** argv) {
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
+    // STRATA_REFILL_STAGED: each GPU's bounce buffers for the lent slots' refill (CUDA0's first, then each stage's)
+    std::vector<std::unique_ptr<strata::core::SlotFiller>> refill_fillers;
     // Issue #10: less RAM available than the whole expert arena.  The arena then swaps while it loads, and on Level
     // Zero the PCIe share later moves it into host USM (make_kernel_readable): GPU driver memory that the OOM killer
     // cannot reclaim, so the GPU VM's rebind swapped it back in and the OOM killer emptied the host (#10, Case 1:
@@ -5833,7 +6046,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_layers.c_str());
             return 1;
         }
-        if (!strata::gpu::alloc_host((void**) &layer_stage, layer_floats * sizeof(float))) {
+        if (!strata::gpu::alloc_host((void**) &layer_stage, layer_floats * sizeof(float), "dump")) {
             std::fprintf(stderr, "strata generate: cannot pin the layer-dump staging buffer\n");
             return 1;
         }
@@ -6613,7 +6826,18 @@ int main(int argc, char** argv) {
         // the chunk plan_lend chose (each stage as below at its prompt path's start), and the RAM copy turns its
         // single lend region off once the stages' experts are left out of it: each part's region is handed to it,
         // the highest slot first, as the borrowing takes them (upstream 51d55a9a, aea9dc3e)
-        if (lend_from >= 0 && !stages.empty()) {
+        // STRATA_STAGE_LEND_DROP=1: no RAM copy of the stages' lend regions.  Their experts are resident in VRAM; the
+        // copy is a second one, page-locked, for the prompt path while it borrows their slots (odie 2026-10-23: 13258
+        // experts, 21.27 GiB of the 27.14 GiB copy).  Without it a prompt reads the lent experts through the mapped
+        // files and the slots refill from there (upstream aea9dc3e, a 73K prompt: 3.7 GiB read from the NVMe instead
+        // of 1.1 GiB, the page cache holding what RAM allows).  kStageLendDropDefault (false): the copy as before.
+        constexpr bool kStageLendDropDefault = false;
+        const char* sld = std::getenv("STRATA_STAGE_LEND_DROP");
+        const bool stage_lend_drop = sld != nullptr && sld[0] != '\0' ? sld[0] != '0' : kStageLendDropDefault;
+        if (lend_from >= 0 && !stages.empty() && stage_lend_drop)
+            std::fprintf(stderr, "strata generate: STRATA_STAGE_LEND_DROP: the split stages' lend regions keep no RAM "
+                                 "copy; a prompt reads their experts from the files\n");
+        if (lend_from >= 0 && !stages.empty() && !stage_lend_drop) {
             auto tail = [&](const strata::core::ExpertCache& c, int64_t lb, int64_t le, int64_t k) {
                 std::vector<std::pair<int32_t, int32_t>> region;
                 for (int64_t l = lb; l < le; ++l)
@@ -6791,6 +7015,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: layer split, CUDA%d: the prompt path borrows %lld cache slots "
                                      "(%.2f GiB)\n", st.dev, (long long) k, (double) st_borrow_bytes / 1073741824.0);
             }
+            // Only the final stage borrows the decode pool. Pipelined chunks on earlier stages never use it;
+            // pipe_drain precedes reads, and Prefill::run joins the full chain before interleaved decode resumes.
+            if (strata::prefill::stream_cpu_owner(strata::prefill::stream_cpu_share_setting() > 0.0,
+                                                  multi_gpu, i + 1 == stages.size(), o.no_pool)) {
+                st.sp.set_stream_cpu_pool(&pool);
+                std::fprintf(stderr, "strata serve: final prompt stage CPU streamed-expert share %.3f (fixed, opt-in)\n",
+                             strata::prefill::stream_cpu_share_setting());
+            }
             const strata::core::OnDevice on(st.dev);
             if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream, err,
                             st_borrow, st_borrow_bytes)) {
@@ -6875,14 +7107,20 @@ int main(int argc, char** argv) {
                     stage_ver_p(st, par).set_always_publish(true);
                 }
         }
+        // homelab window-row prefill: only the pipelined slot groups (no --batch-mtp) take prompt rows.  Their windows
+        // are the whole capacity (STRATA_BATCH_MAX_T) and a group's hand-off rows are [group x capacity, + capacity),
+        // so the hand-off holds groups x capacity rows.
+        const bool wp_on = window_prefill_settings().on && o.batch > 0 && o.batch_groups > 1 && !batch_mtp &&
+                           n_stages > 1 && !split_same && (int) stages.size() == n_stages - 1;
+        const int wp_handoff_rows = wp_on ? o.batch_groups * strata::kernels::verify_max_t() : 0;
         if (n_stages > 1) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) std::max({strata::kernels::verify_max_t(), o.batch, wp_handoff_rows}) *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto dev_of = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
                 float* hh = nullptr;
-                if (!strata::gpu::alloc_host((void**) &hh, hb)) return nullptr;
+                if (!strata::gpu::alloc_host((void**) &hh, hb, "split-handoff")) return nullptr;
                 std::memset(hh, 0, hb);
                 return hh;
             };
@@ -6912,12 +7150,14 @@ int main(int argc, char** argv) {
                 bool ok_s = false;
                 if (split_same) {
                     ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                                         std::max(o.spec, o.batch), err);
+                                         wp_on ? strata::kernels::verify_max_t()
+                                               : std::min(strata::kernels::verify_max_t(), std::max(o.spec, o.batch)), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
+                    vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
@@ -6927,7 +7167,7 @@ int main(int argc, char** argv) {
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp || wp_on ? strata::kernels::verify_max_t() : std::min(strata::kernels::verify_max_t(), std::max(o.spec, o.batch)), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
@@ -6951,6 +7191,9 @@ int main(int argc, char** argv) {
                                              "CUDA0's host memory: the CPU takes its missed experts (no PCIe share)\n",
                                      gs.dev);
                     split_drive.pcie_num[st] = gs.pcie_reads ? pcie_num_of(gs.pcie_frac) : 0;
+                    // a share it can never read: its windows may leave that path out (STRATA_SKIP_NO_PCIE_SHARE)
+                    gs.ver.set_no_pcie_share(!gs.pcie_reads);
+                    gs.ver_b.set_no_pcie_share(!gs.pcie_reads);
                 }
                 if (!ok_s) {
                     std::fprintf(stderr, "strata serve: layer split, stage %d: %s\n", st + 1, err.c_str());
@@ -6970,12 +7213,12 @@ int main(int argc, char** argv) {
         // Verifier::pl_finish copies it across.
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) std::max(strata::kernels::verify_max_t(), o.batch) *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
                 float* hh = nullptr;
-                if (!strata::gpu::alloc_host((void**) &hh, hb)) return nullptr;
+                if (!strata::gpu::alloc_host((void**) &hh, hb, "split-handoff")) return nullptr;
                 std::memset(hh, 0, hb);
                 return hh;
             };
@@ -7028,7 +7271,7 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
         if (adapt_device_table_lags()) ver.set_always_publish(true);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp || wp_on ? strata::kernels::verify_max_t() : std::min(strata::kernels::verify_max_t(), std::max(o.spec, o.batch)), err) ||
             (use_mtp &&
              !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                        pipe ? pl_mtp_R : ver.final_R_all(), err))) {
@@ -7065,6 +7308,11 @@ int main(int argc, char** argv) {
             std::vector<strata::core::SessionState*> ptrs;
             ptrs.reserve(bslot_ss.size());
             for (auto& u : bslot_ss) ptrs.push_back(u.get());
+            if (wp_on)   // before init_slots and the async outbound (its rows); the layouts the reading slots make
+                for (int st = 0; st < n_stages; ++st) {
+                    stage_ver(st).set_handoff_rows(wp_handoff_rows);
+                    stage_ver(st).set_batch_graph_limit((size_t) window_prefill_settings().graph_limit);
+                }
             bool slots_ok = ver.init_slots(ptrs, err);
             // a layer split: every later stage's verifier takes its own GPU's sessions (--split-device 0: the same)
             for (int st = 1; slots_ok && st < n_stages; ++st) {
@@ -7080,6 +7328,12 @@ int main(int argc, char** argv) {
                 err.clear();
                 o.batch = 0;
             }
+            if (slots_ok && o.batch_groups > 1 && !batch_mtp)
+                for (int st = 0; st + 1 < n_stages; ++st)
+                    if (!stage_ver(st).enable_batch_outbound(err)) {
+                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                        return 1;
+                    }
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
@@ -7229,6 +7483,7 @@ int main(int argc, char** argv) {
         bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+        uint64_t origin_clock = 0;  // homelab shared prefix: each checkpoint save names its read (ConvCheckpoint::origin)
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // ---- parked conversations (--conversation-cache-mib, upstream ccc660b-cecf697): when a request continues
@@ -7298,6 +7553,22 @@ int main(int argc, char** argv) {
             else
                 std::fprintf(stderr, "strata serve: conversation save: off (%s)\n", de.c_str());
         }
+        // homelab background park: the slot park's writes on a thread of their own, through a second folder connection
+        std::unique_ptr<strata::core::ConversationParkQueue> park_q;
+        if (disk.enabled() && slot_park_settings().on && slot_park_async_settings().on) {
+            std::string de;
+            if (auto wf = disk.open_writer_folder(de)) {
+                const auto& as = slot_park_async_settings();
+                park_q = std::make_unique<strata::core::ConversationParkQueue>(disk.options(), std::move(wf),
+                                                                              (size_t) as.jobs,
+                                                                              (size_t) as.mib << 20);
+                std::fprintf(stderr, "strata serve: slot park: background writer on (queue %lld images, %lld MiB)\n",
+                             (long long) as.jobs, (long long) as.mib);
+            } else {
+                std::fprintf(stderr, "strata serve: slot park: background writer off, writing on the serve thread "
+                                     "(%s)\n", de.c_str());
+            }
+        }
         Clock::time_point disk_expired_at = Clock::now();
         // a failed write loses only the saved copy: the conversation is read again when it comes back
         auto save_one = [&](const strata::core::SavedConversation& image, const char* why) {
@@ -7313,6 +7584,23 @@ int main(int argc, char** argv) {
             else
                 std::fprintf(stderr, "strata serve: conversation save: %zu tokens not written (%s)\n",
                              image.live.ids.size(), de.c_str());
+        };
+        // the background park's finished writes go into the folder's index (this thread owns it); a failed one only
+        // costs that conversation's next turn its history read
+        auto adopt_parks = [&]() {
+            if (!park_q) return;
+            for (auto& d : park_q->done()) {
+                if (d.ok) {
+                    disk.adopt(d.file);
+                    std::fprintf(stderr, "strata serve: conversation save: wrote %zu tokens (slot park, background, "
+                                         "%zu MiB) in %.1f ms after %.1f ms queued; files=%zu folder=%zu MiB\n",
+                                 d.tokens, d.file.bytes >> 20, d.write_ms, d.queued_ms, disk.size(),
+                                 disk.folder_bytes() >> 20);
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation save: %zu tokens not written (slot park, "
+                                         "background: %s)\n", d.tokens, d.error.c_str());
+                }
+            }
         };
         std::vector<strata::core::SavedConversation> evicted;   // what the RAM cache pushed out, until written
         auto save_evicted = [&]() {
@@ -7605,6 +7893,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
+            c.origin = ++origin_clock;
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
                 c.gdn = std::move((*parts)[0].gdn);
@@ -7801,13 +8090,14 @@ int main(int argc, char** argv) {
         strata::gpu::Event* adapt_ev = nullptr;
         strata::gpu::event_create(&adapt_ev);
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
-        auto res_upload = [&]() {
-            if (d_res != nullptr)
-                strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
+        auto res_upload = [&]() -> bool {
+            if (d_res != nullptr &&
+                !strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t))) return false;
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
-                strata::gpu::copy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t));
+                if (!strata::gpu::copy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t))) return false;
             }
+            return true;
         };
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
@@ -8411,9 +8701,12 @@ int main(int argc, char** argv) {
         sp.should_stop = [&] { return stop_req.load(); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        // (homelab: each line ends with @<ms since the serve loop began>, so the steps of a request can be timed)
+        const Clock::time_point tr0 = Clock::now();
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
+            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f\n", what, a, b,
+                         std::chrono::duration<double, std::milli>(Clock::now() - tr0).count());
             std::fflush(stderr);
         };
         {
@@ -8464,6 +8757,9 @@ int main(int argc, char** argv) {
                                  stp->dev, (long long) sf_mib, (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        // every pinned host pool, one line: host USM is outside the RAM the OS reclaims and outside a container's
+        // memory limit (STRATA_HOST_PIN_MAX_GIB caps it)
+        std::fprintf(stderr, "strata serve: %s\n", strata::gpu::host_pin_report().c_str());
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -8477,7 +8773,7 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
-                        "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d experts_ram=%s "
+                        "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d slot_context=%lld big_slots=%d experts_ram=%s "
                         "engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -8488,7 +8784,9 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
-                        o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram);
+                        o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0,
+                        (long long) (o.slot_context > 0 ? slot_cells(o, o.batch) : o.max_context), o.big_slots,
+                        experts_ram);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -8695,8 +8993,81 @@ int main(int argc, char** argv) {
             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
+            // homelab window-row prefill (STRATA_BATCH_PREFILL): the slot reads `prompt` in its group's windows, from
+            // ids.size() (the tokens its sessions hold, committed) on; its first token is its last prompt row's pick.
+            // `setup`: its sessions' work before its first window (1: zeroed, a prompt from token 0; 2: checks[0]'s
+            // running state put back), `setup_left` the stages (bits) still to do it at their launch.  `cut`: where
+            // its turn checkpoint is saved (-1: none), each stage's part in `cut_parts` at that stage's end of the
+            // window that reaches it.  `since`: admission order (the fifo split).
+            bool prefill = false;
+            std::vector<int32_t> prompt;
+            int setup = 0;
+            uint32_t setup_left = 0;
+            int64_t cut = -1, reused = 0;
+            std::vector<ConvCheckpoint> cut_parts;
+            bool cut_bad = false;
+            uint64_t since = 0;
+            Clock::time_point admitted;
+            // homelab shared prefix (STRATA_SHARED_PREFIX, shared_prefix.hpp): `root`, a shared checkpoint of this
+            // slot's own history (its K/V below it is a byte copy of the read that wrote it), held by reference so the
+            // slots of one origin keep one copy; another conversation that starts with it starts from this slot.
+            // Window-row prefill's setup 3: stage parts copied from slot `src`'s root (`src_ck`) at each stage's
+            // launch; `lent`: the slots still to copy from this one (it takes no new request until they have).
+            std::shared_ptr<const ConvCheckpoint> root;
+            int src = -1;
+            std::shared_ptr<const ConvCheckpoint> src_ck;
+            int lent = 0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        const strata::program::shared_prefix::Settings& shp = shared_prefix_settings();
+        const bool shp_on = shp.on && o.batch > 0 && o.prompt_cache > 0;
+        // the distinct roots the slots hold (one per origin); entries no slot holds any more are dropped as they go
+        std::vector<std::shared_ptr<const ConvCheckpoint>> shp_roots;
+        int64_t shp_learned = 0, shp_from_slot = 0, shp_window = 0;   // learned cuts, request-path and window uses
+        auto shp_slot = [&](const BSlot& sl) {
+            strata::program::shared_prefix::SlotState x;
+            x.active = sl.active;
+            x.cached = sl.cached;
+            x.tainted = sl.tainted;
+            x.img = sl.img;
+            x.cvec_match = sl.cvec == cvec_cached;
+            x.setting_up = sl.setup_left != 0;
+            x.held = (int64_t) sl.ids.size();
+            return x;
+        };
+        auto holds_prefix = [](const std::vector<int32_t>& ids, const std::vector<int32_t>& pre) {
+            return pre.size() <= ids.size() && std::equal(pre.begin(), pre.end(), ids.begin());
+        };
+        // slot sl's root if another conversation may start from it now (its K/V below it unchanged since)
+        auto shp_root_of = [&](const BSlot& sl) -> const ConvCheckpoint* {
+            if (!shp_on || sl.root == nullptr) return nullptr;
+            const strata::program::shared_prefix::SlotState x = shp_slot(sl);
+            const int64_t len = (int64_t) sl.root->ids.size();
+            return strata::program::shared_prefix::checkpoint_ok(x, len, holds_prefix(sl.ids, sl.root->ids))
+                       ? sl.root.get() : nullptr;
+        };
+        // the registry without the roots no slot can serve from any more (their slots moved on or stopped being caches)
+        auto shp_prune = [&] {
+            for (BSlot& sl : bs)
+                if (sl.root != nullptr && shp_root_of(sl) == nullptr && sl.lent == 0) sl.root.reset();
+            shp_roots.erase(std::remove_if(shp_roots.begin(), shp_roots.end(),
+                                           [](const std::shared_ptr<const ConvCheckpoint>& r) { return r.use_count() == 1; }),
+                            shp_roots.end());
+        };
+        // `c` as a root a slot keeps: the registry's copy of its origin, or a new one where the limits allow
+        auto shp_share = [&](const ConvCheckpoint& c) -> std::shared_ptr<const ConvCheckpoint> {
+            if (c.origin == 0) return nullptr;
+            shp_prune();
+            size_t held_bytes = 0;
+            for (const auto& r : shp_roots) {
+                if (r->origin == c.origin) return r;
+                held_bytes += r->bytes();
+            }
+            if (!strata::program::shared_prefix::root_fits((int) shp_roots.size(), held_bytes, c.bytes(), false, shp))
+                return nullptr;
+            shp_roots.push_back(std::make_shared<const ConvCheckpoint>(c));
+            return shp_roots.back();
+        };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0, bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
@@ -8708,6 +9079,7 @@ int main(int argc, char** argv) {
         int64_t bt_a_rounds0 = 0, bt_a_swapped0 = 0;   // the asynchronous tier's counters when the timed windows began
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+        int64_t slot_parks = 0;            ///< homelab STRATA_SLOT_PARK: idle slots' conversations written before reuse
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
@@ -8724,12 +9096,21 @@ int main(int argc, char** argv) {
             auto one = [&](int dev, strata::core::SessionState& from, strata::core::SessionState& to) -> bool {
                 const strata::core::OnDevice on(dev);
                 if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
-                strata::core::ConversationCheckpoint ck;
-                ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                    return false;
+                if (slot_direct_copy()) {
+                    if (!strata::core::conversation_state_copy(ids, from, to, g, e)) return false;
+                } else {
+                    strata::core::ConversationCheckpoint ck;
+                    ck.ids = ids;
+                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                        return false;
+                }
                 for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {   // the owned layers
+                    if (slot_direct_copy()) {
+                        if (!strata::core::conversation_kv_copy(from.qsa_states[j], to.qsa_states[j], g, upto, true, e))
+                            return false;
+                        continue;
+                    }
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
                     if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
@@ -8744,12 +9125,15 @@ int main(int argc, char** argv) {
             if (batch_mtp) {   // the prompt read built the main drafter's K/V: the slot's drafter continues from it
                 const strata::core::OnDevice on_mtp(mtp.device());   // both drafters' K/V (the last stage's GPU)
                 strata::core::ConversationKv image;
-                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(), draft_geometry, upto,
-                                                           false, e) ||
-                    !strata::gpu::device_sync())
+                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e)) return false;
+                if (slot_direct_copy() ? !strata::core::conversation_kv_copy(mtp.kv_state(), slot_mtp[(size_t) b]->kv_state(),
+                                                                             draft_geometry, upto, false, e)
+                                       : !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto,
+                                                                             false, e) ||
+                                             !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                                                                                    draft_geometry, upto, false, e))
                     return false;
+                if (!strata::gpu::device_sync()) return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
             return true;
@@ -8757,38 +9141,176 @@ int main(int argc, char** argv) {
         // slot b's session -> the main one (the reverse of copy_to_slot): a request that continues the conversation an
         // idle slot holds reads on from there.  `at`: one of the slot's checkpoints - only the K/V up to it is copied
         // and its state restored instead
+        // A layer split (STRATA_SLOT_SPLIT_REUSE=1, homelab): every stage's slot session goes back to that stage's main
+        // session on its own GPU, as copy_to_slot wrote it; a slot checkpoint carries the later stages' running state
+        // in its stage_parts (checkpoint_at saves them so under a split).
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
-            strata::core::SessionState& from = *bslot_ss[(size_t) b];
-            if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
-            if (at != nullptr) {
-                if (!strata::core::conversation_checkpoint_restore(*at, ss, g, e)) return false;
-            } else {
-                strata::core::ConversationCheckpoint ck;
-                ck.ids = bs[(size_t) b].ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, ss, g, e))
-                    return false;
+            if (at != nullptr && at->stage_parts.size() != stages.size()) {
+                e = "batch slot restore: the slot checkpoint's stage parts differ from the split";
+                return false;
             }
-            for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {
-                strata::core::ConversationKv img;
-                if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
+            // stage i: 0 = the main session (this GPU), i > 0 = stages[i - 1] on its own GPU
+            auto one = [&](int dev, strata::core::SessionState& from, strata::core::SessionState& to,
+                           const ConvCheckpoint* part) -> bool {
+                const strata::core::OnDevice on(dev);
                 if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
-                if (!strata::core::conversation_kv_restore(img, ss.qsa_states[j], g, upto, true, e)) return false;
-            }
-            if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
+                // K/V first, then the running state over it: the spare indexer row from the checkpoint's dead keys,
+                // never the slot's later block row (conversation_slot_read_back; shared prefix: on the same order)
+                return strata::core::conversation_slot_read_back(part, bs[(size_t) b].ids, from, to, g,
+                                                                 slot_direct_copy(), e);
+            };
+            if (!one(0, *bslot_ss[(size_t) b], ss, at)) return false;
+            for (size_t i = 0; i < stages.size(); ++i)
+                if (!one(stages[i]->dev, *stages[i]->bslots[(size_t) b], stages[i]->ss,
+                         at != nullptr ? &at->stage_parts[i] : nullptr))
+                    return false;
             if (batch_mtp) {   // a returning request resumes from its slot's draft K/V
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
-                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(), draft_geometry, upto,
-                                                        false, e) ||
-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::gpu::device_sync())
+                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e)) return false;
+                if (slot_direct_copy() ? !strata::core::conversation_kv_copy(slot_mtp[(size_t) b]->kv_state(), mtp.kv_state(),
+                                                                             draft_geometry, upto, false, e)
+                                       : !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                                                                             draft_geometry, upto, false, e) ||
+                                             !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry,
+                                                                                    upto, false, e))
                     return false;
+                if (!strata::gpu::device_sync()) return false;
                 mtp.set_prompt_len(upto);
             }
             return true;
+        };
+        // homelab slot park: whether `prompt` goes on with the conversation idle slot `sl` holds - all of it, or its
+        // deepest turn checkpoint (a client renders the history again without the last reply's thinking).  Anything
+        // else that takes the slot overwrites that conversation.
+        auto slot_continued = [&](const BSlot& sl, const auto& prompt) -> bool {
+            const ConvCheckpoint* deepest = nullptr;
+            for (const ConvCheckpoint& c : sl.checks)
+                if (deepest == nullptr || c.ids.size() > deepest->ids.size()) deepest = &c;
+            return strata::program::slot_park::continued(sl.ids, deepest ? &deepest->ids : nullptr, prompt);
+        };
+        auto slot_parkable = [&](const BSlot& sl) {
+            return strata::program::slot_park::parkable(
+                slot_park_settings(), disk.enabled(),
+                {sl.active, sl.cached, sl.img, sl.tainted, sl.partial, sl.lent, (int64_t) sl.ids.size()});
+        };
+        // slot b's conversation -> --conversation-save (its sessions, every stage of a layer split, its checkpoints and
+        // its draft K/V: the slot's own with --batch-mtp, else the main drafter's, as copy_from_slot leaves it - a draft
+        // is only a proposal the model verifies, so the reply is the same either way).  A failure costs only the saved
+        // copy: the conversation's next turn reads its history, as without the lever.
+        auto park_slot = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            const auto t0 = Clock::now();
+            std::string e;
+            const std::vector<strata::core::ConversationImageKey> no_imgs;
+            const strata::core::ConversationView view{sl.ids, no_imgs, sl.checks, sl.cvec};
+            const strata::core::QsaState& draft = batch_mtp ? slot_mtp[(size_t) b]->kv_state() : mtp.kv_state();
+            std::vector<strata::core::ConversationStage> parts;
+            if (!stages.empty()) {
+                parts.push_back({bslot_ss[(size_t) b].get(), 0});
+                for (auto& st : stages) parts.push_back({st->bslots[(size_t) b].get(), st->dev});
+            }
+            size_t bytes = 0;
+            const bool sized = parts.empty()
+                ? strata::core::conversation_snapshot_bytes(view, *bslot_ss[(size_t) b], g, draft, bytes, e)
+                : strata::core::conversation_split_bytes(view, parts, g, draft, bytes, e);
+            const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+            const auto mem = strata::core::sample_host_memory();
+            if (!sized || !strata::core::conversation_memory_admit(
+                              mem ? std::optional<uint64_t>(mem->available) : std::nullopt, bytes, floor)) {
+                std::fprintf(stderr, "strata batch: slot park: slot %d's %zu tokens not parked (%s)\n", b, sl.ids.size(),
+                             sized ? ("physical RAM admission, " + ram_note(mem)).c_str() : e.c_str());
+                return;
+            }
+            try {
+                strata::core::SavedConversation image;
+                const bool ok = strata::gpu::device_sync() &&
+                    (parts.empty() ? strata::core::conversation_snapshot_save(image, view, *bslot_ss[(size_t) b], g, draft, e)
+                                   : strata::core::conversation_split_save(image, view, parts, g, draft, e));
+                if (!ok) {
+                    std::fprintf(stderr, "strata batch: slot park: capturing slot %d failed (%s)\n", b, e.c_str());
+                    return;
+                }
+                const double capture_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                ++slot_parks;
+                std::fprintf(stderr, "strata batch: slot park: slot %d's %zu tokens captured (%zu MiB) in %.1f ms\n", b,
+                             sl.ids.size(), image.bytes() >> 20, capture_ms);
+                if (park_q) {   // the write goes on behind the decode
+                    double waited = 0;
+                    park_q->push(std::move(image), waited);
+                    std::fprintf(stderr, "strata batch: slot park: slot %d queued for the background writer (waited "
+                                         "%.1f ms for room; %zu queued, %zu MiB)\n", b, waited, park_q->jobs(),
+                                 park_q->bytes() >> 20);
+                } else {
+                    save_one(image, "slot park");
+                }
+                std::fprintf(stderr, "strata batch: slot park: slot %d held the serve thread %.1f ms\n", b,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata batch: slot park: allocation failed; slot %d not parked\n", b);
+            }
+        };
+        // ---- homelab window-row prefill (STRATA_BATCH_PREFILL, window_prefill.hpp): a reading slot's sessions are
+        // zeroed, restored and saved per stage, each on a stream of its own and only while that stage's GPU runs no
+        // window (the stage's launch of the slot's group, the stage's end of it): a device sync would wait for windows
+        // that wait for this thread's doorbell service.  Part 0 is the slot's session on CUDA0, part i + 1 its session
+        // on stages[i]'s GPU.
+        std::vector<strata::gpu::Stream> wp_q(wp_on ? stages.size() + 1 : 0, nullptr);
+        std::vector<std::vector<uint8_t>> wp_staging(wp_q.size());
+        auto wp_part = [&](int b, int k, int& dev) -> strata::core::SessionState& {
+            dev = k == 0 ? 0 : stages[(size_t) k - 1]->dev;
+            return k == 0 ? *bslot_ss[(size_t) b] : *stages[(size_t) k - 1]->bslots[(size_t) b];
+        };
+        auto wp_stream = [&](int k, int dev, std::string& e) -> strata::gpu::Stream {
+            if (wp_q[(size_t) k] == nullptr) wp_q[(size_t) k] = strata::gpu::stream_create();
+            if (wp_q[(size_t) k] == nullptr) e = "window prefill: no stream on CUDA" + std::to_string(dev);
+            return wp_q[(size_t) k];
+        };
+        // stage k's part of slot b set up for its first window (1: zeroed, 2: `from` put back, 3: `from` - slot
+        // bs[b].src's root - with that slot's K/V below it, shared prefix)
+        auto wp_setup = [&](int b, int k, int how, const ConvCheckpoint& from, std::string& e) -> bool {
+            int dev = 0;
+            strata::core::SessionState& s = wp_part(b, k, dev);
+            const strata::core::OnDevice on(dev);
+            const strata::gpu::Stream q = wp_stream(k, dev, e);
+            if (q == nullptr) return false;
+            if (how == 3) {
+                if (from.stage_parts.size() != stages.size() || bs[(size_t) b].src < 0) {
+                    e = "window prefill: the shared prefix's stage parts differ from the split";
+                    return false;
+                }
+                int src_dev = 0;
+                const strata::core::SessionState& h = wp_part(bs[(size_t) b].src, k, src_dev);
+                return strata::core::conversation_prefix_copy(k == 0 ? from : from.stage_parts[(size_t) k - 1], h, s, g, q,
+                                                              e);
+            }
+            if (how == 2) {
+                if (from.stage_parts.size() != stages.size()) {
+                    e = "window prefill: the slot checkpoint's stage parts differ from the split";
+                    return false;
+                }
+                return strata::core::conversation_checkpoint_restore_on(k == 0 ? from : from.stage_parts[(size_t) k - 1],
+                                                                       s, g, q, e);
+            }
+            strata::core::session_zero(s, g, nullptr, q);
+            if (strata::gpu::stream_sync(q)) return true;
+            e = std::string("window prefill: zeroing a slot: ") + strata::gpu::last_error();
+            return false;
+        };
+        // stage k's part of slot b's running state after `ids` (its turn checkpoint's part)
+        auto wp_save = [&](int b, int k, const std::vector<int32_t>& ids, ConvCheckpoint& c, std::string& e) -> bool {
+            int dev = 0;
+            const strata::core::SessionState& s = wp_part(b, k, dev);
+            const strata::core::OnDevice on(dev);
+            const strata::gpu::Stream q = wp_stream(k, dev, e);
+            if (q == nullptr) return false;
+            std::vector<uint8_t>& st = wp_staging[(size_t) k];
+            st.resize(strata::core::conversation_checkpoint_staged_bytes(s, g));
+            c = ConvCheckpoint{};
+            c.ids = ids;
+            return !st.empty() && strata::core::conversation_checkpoint_stage(st.data(), q, s, g, ids.size(), e) &&
+                   strata::core::conversation_checkpoint_unstage(c, st.data(), s, g, e);
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds (#465)
@@ -8803,9 +9325,10 @@ int main(int argc, char** argv) {
             static size_t next_slot = 0;
             int A = 0;
             const int per = batch_mtp ? 2 : 1;
-            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::verify_max_t(); ++offset) {
                 const int b = batch_mtp ? (int) ((next_slot + offset) % bs.size()) : (int) offset;
-                if (!bs[(size_t) b].active) continue;
+                // a slot reading its prompt in the pipelined windows (window-row prefill) waits for them
+                if (!bs[(size_t) b].active || bs[(size_t) b].prefill) continue;
                 first[A] = S;
                 active[A++] = b;
                 rows[S] = b;
@@ -8847,12 +9370,16 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds;
                 bt_a_swapped0 = a_swapped;
             }
+            homelab_profile::Window hp_window(S, A);
+            homelab_profile::Span hp_run("batch.run");
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
+            hp_run.end();
+            homelab_profile::Span hp_commit("batch.commit");
             // The adaptive VRAM tier, as the solo loop runs it (upstream e989c671): every --adapt-every windows, on a
             // thread beside the commit, the emits and the drafts.  Every stage's window has finished here, and nothing
             // in flight reads the slots a swap overwrites; the swaps land (apply_pending) before this window ends, so
@@ -8874,13 +9401,15 @@ int main(int argc, char** argv) {
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[(size_t) b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
-                                   sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                                   sl.produced + 2 <= sl.max_new && sl.p + 3 <= slot_cells(o, b) ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
             const Clock::time_point w2 = Clock::now();
+            hp_commit.end();
+            homelab_profile::Span hp_emit("batch.emit_including_mtp_stdout");
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
@@ -8913,7 +9442,7 @@ int main(int argc, char** argv) {
                     ++sl.produced;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                                    : sl.p + 2 > slot_cells(o, b) ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
@@ -8940,6 +9469,7 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
+            hp_emit.end();
             if (adapt_run.th.joinable()) {
                 const Clock::time_point wa = Clock::now();
                 adapt_run.th.join();
@@ -9001,7 +9531,7 @@ int main(int argc, char** argv) {
             std::mutex mu;
             std::condition_variable cv;
             bool go = false, quit = false;
-            std::atomic<int> result{2};   // 0 running, 1 done, -1 failed, 2 idle
+            std::atomic<int> result{3};   // 0 running, 1 delivered, 2 outbound pending, -1 failed, 3 idle
             std::string err;
         };
         std::vector<std::unique_ptr<StagePoll>> spoll;
@@ -9037,16 +9567,129 @@ int main(int argc, char** argv) {
             }
         struct PGroup {
             bool inflight = false;
-            int stage = 0;                  ///< the stage it runs on or waits for
+            int stage = 0;                  ///< the stage it runs on or waits for (-1: outbound copy pending)
+            int outbound_stage = -1;        ///< the producing stage whose copy still owns this group's rows
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< the turn it started waiting (the longest waiting goes first)
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
+            // the window's rows (homelab window-row prefill: a reading slot owns a run of them): R rows, row r is slot
+            // rows[r]; slot t of the group (t < S) has its rows from first[t], nrow[t] of them, keep[t] kept, and was
+            // idle (0: a pad row), decoding (1) or reading its prompt (2) when the window started; `cutnow`: its
+            // window ends at its turn checkpoint.  keepv: keep by global slot (Verifier::batch_launch_rows)
+            int R = 0;
+            int rows[strata::kernels::kVerifyMaxT] = {};
+            int first[strata::kernels::kVerifyMaxT] = {}, nrow[strata::kernels::kVerifyMaxT] = {};
+            int keep[strata::kernels::kVerifyMaxT] = {}, kind[strata::kernels::kVerifyMaxT] = {};
+            bool cutnow[strata::kernels::kVerifyMaxT] = {};
+            std::vector<int> keepv;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+        for (PGroup& x : pg) x.keepv.assign(bs.size(), 1);
+        // a group's hand-off rows: [group x window capacity, + capacity) for window-row prefill, else its slots'
+        const int wp_cap = strata::kernels::verify_max_t();
+        auto hbase_of = [&](int gi) { return wp_on ? gi * wp_cap : gi * GS; };
+        int64_t wp_rows = 0, wp_pad = 0, wp_admits = 0;   // since the last timing line: prompt rows kept, pad rows
+        uint64_t wp_clock = 0;
+        const ConvCheckpoint wp_none;
+        // stage k of slot b's first-window setup, done; the last stage of a shared-prefix setup frees its source slot
+        auto wp_setup_stage = [&](int b, int k) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            std::string e;
+            const ConvCheckpoint& from = sl.setup == 3 ? *sl.src_ck : sl.checks.empty() ? wp_none : sl.checks[0];
+            if (!wp_setup(b, k, sl.setup, from, e)) {
+                std::printf("ERR window prefill: slot %d: %s\n", b, e.c_str());
+                return false;
+            }
+            sl.setup_left &= ~(1u << k);
+            if (sl.setup_left == 0 && sl.src >= 0) {
+                --bs[(size_t) sl.src].lent;
+                sl.src = -1;
+                sl.src_ck.reset();
+            }
+            return true;
+        };
+        // shared prefix: before a request may overwrite a slot (the windows drained), every pending setup that copies
+        // from another slot runs now (no window in flight on any stage), so no slot is a source any more
+        auto wp_settle_sources = [&]() -> bool {
+            for (int b = 0; b < (int) bs.size(); ++b)
+                for (int k = 0; k < n_pipe && bs[(size_t) b].setup == 3 && bs[(size_t) b].setup_left != 0; ++k)
+                    if ((bs[(size_t) b].setup_left >> k & 1u) != 0 && !wp_setup_stage(b, k)) return false;
+            return true;
+        };
+        // an idle slot's row in a group window: a pad row that leaves its conversation (window_prefill::pad_row), or
+        // where the verifier cannot skip it, position 0 kept (the slot is no cache any more)
+        const bool pad_harmless = strata::core::Verifier::pad_rows_harmless();
+        auto idle_row = [&](int b) {
+            const BSlot& sl = bs[(size_t) b];
+            const int64_t cells = std::min<int64_t>(slot_cells(o, b), bslot_ss[(size_t) b]->max_cells);
+            return strata::program::window_prefill::pad_row(pad_keeps_idle(), pad_harmless, (int64_t) sl.ids.size(),
+                                                            cells);
+        };
+        // window-row prefill: group gi's next window planned (window_prefill::plan_window) into G's rows
+        auto wp_plan = [&](int gi, PGroup& G) -> bool {
+            namespace wp = strata::program::window_prefill;
+            std::vector<wp::SlotIn> in((size_t) GS);
+            for (int t = 0; t < GS; ++t) {
+                const int b = gi * GS + t;
+                const BSlot& sl = bs[(size_t) b];
+                wp::SlotIn& x = in[(size_t) t];
+                if (!sl.active) continue;
+                x.kind = sl.prefill ? wp::SlotIn::Prefill : wp::SlotIn::Decode;
+                if (!sl.prefill) continue;
+                const int64_t have = (int64_t) sl.ids.size();
+                x.left = (int64_t) sl.prompt.size() - have;
+                x.to_cut = sl.cut > have ? sl.cut - have : 0;
+                x.room = slot_cells(o, b) - have;
+                x.since = sl.since;
+            }
+            std::vector<wp::SlotOut> out;
+            const int S = wp::plan_window(in, wp_cap, window_prefill_settings(), out);
+            if (S < 1) {
+                std::printf("ERR window prefill: group %d's window does not fit its %d rows\n", gi, wp_cap);
+                return false;
+            }
+            G.S = S;
+            G.R = 0;
+            for (int t = 0; t < S; ++t) {
+                const int b = gi * GS + t;
+                BSlot& sl = bs[(size_t) b];
+                const wp::SlotOut& w = out[(size_t) t];
+                G.first[t] = G.R;
+                G.nrow[t] = w.rows;
+                G.keep[t] = w.keep;
+                G.kind[t] = !sl.active ? 0 : sl.prefill ? 2 : 1;
+                G.keepv[(size_t) b] = w.keep;
+                const int64_t have = (int64_t) sl.ids.size();
+                G.cutnow[t] = G.kind[t] == 2 && sl.cut > have && have + w.keep == sl.cut;
+                const strata::program::window_prefill::PadRow pad = sl.active ? strata::program::window_prefill::PadRow{}
+                                                                              : idle_row(b);
+                if (!sl.active) {
+                    G.keep[t] = G.keepv[(size_t) b] = pad.keep;
+                    if (pad.writes_slot) sl.cached = false;   // its row writes its state
+                }
+                for (int j = 0; j < w.rows; ++j, ++G.R) {
+                    G.rows[G.R] = b;
+                    if (G.kind[t] == 2) {   // its next prompt tokens; the pad rows past `keep` repeat the last one
+                        const int64_t at = have + std::min(j, w.keep - 1);
+                        G.tok[G.R] = sl.prompt[(size_t) at];
+                        G.pos[G.R] = have + j;
+                    } else {
+                        G.tok[G.R] = sl.active ? sl.x : 0;
+                        G.pos[G.R] = sl.active ? sl.p : pad.pos;
+                    }
+                }
+            }
+            return true;
+        };
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
         std::vector<double> pipe_pool0((size_t) n_pipe, 0.0);   // each stage's CPU-expert time at the run's start
+        // host-clocked windows per stage (beside STRATA_VERIFY_PROFILE's device time): the batch_launch call,
+        // then launch to the poll that saw it done
+        std::vector<Clock::time_point> st_t0((size_t) n_pipe);
+        std::vector<double> st_launch((size_t) n_pipe, 0.0), st_run((size_t) n_pipe, 0.0);
+        std::vector<int64_t> st_n((size_t) n_pipe, 0);
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) gi * (size_t) GS + (size_t) t].active) return true;
@@ -9055,12 +9698,126 @@ int main(int argc, char** argv) {
         if (piped)
             std::fprintf(stderr, "strata serve: --batch %d in %d groups of %d, pipelined through %d GPUs\n", o.batch,
                          o.batch_groups, GS, n_pipe);
+        // STRATA_BATCH_TIMELINE=<n> (homelab K2): where each stage's window time goes, reported every n group-steps.
+        // Columns (ms per window; mean and median): prep = batch_launch's host staging before the graph submit,
+        // submit = the graph launch call(s), gpu = device span from the tag before the window's graph to the tag after
+        // its last graph, idle = the device's gap from the previous window's end tag to this window's start tag on the
+        // stage, start = device start minus the submit's return (host clock, through the measured offset), notice =
+        // the poll that saw the end minus the device end, waitgrp = the stage free (its last notice) until the group it
+        // takes next was ready (the other stage's notice), pump = from both until this launch began, cycle = device
+        // start to start.  The rest of a window is stage_batch etc. inside prep.  With STRATA_VERIFY_PROFILE too,
+        // out-ticks(raw) is the non-final stage's out hand-off on its named clock; out-est is ms estimated using only
+        // this window's calibrated average tick rate (DVFS can bias it).  Missing/invalid calibration stays UNKNOWN.
+        const int tl_every = strata::core::Verifier::batch_timeline();
+        enum { kTlPrep, kTlSubmit, kTlGpu, kTlIdle, kTlStart, kTlNotice, kTlWaitGrp, kTlPump, kTlCycle,
+               kTlOutEst, kTlOutTicks, kTlCols };
+        static const char* const tl_names[kTlCols] = {"prep", "submit", "gpu", "idle", "start", "notice", "waitgrp",
+                                                      "pump", "cycle", "out-est", "out-ticks(raw)"};
+        struct TlAcc {
+            std::vector<double> v[kTlCols];
+            int64_t free_ns = 0;
+            uint64_t dend = 0, dstart = 0;
+            bool prev = false, off_ok = false;
+            double off = 0;
+            size_t nodes = 0;
+            size_t out_unknown = 0;
+            const char* out_clock = nullptr;
+            const char* out_scope = nullptr;
+        };
+        std::vector<TlAcc> tla((size_t) n_pipe);
+        std::vector<int64_t> tl_ready((size_t) (piped ? o.batch_groups : 0), 0);
+        int64_t tl_steps = 0;
+        auto tl_ns = [](Clock::time_point t) {
+            return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+        };
+        auto tl_calibrate = [&] {
+            for (int k = 0; k < n_pipe; ++k)
+                tla[(size_t) k].off_ok = stage_ver(k).device_clock_offset(&tla[(size_t) k].off);
+        };
+        auto tl_done = [&](int k, int gi) {
+            TlAcc& a = tla[(size_t) k];
+            const strata::core::Verifier::BatchTimes& b = stage_ver(k).batch_times();
+            a.nodes = b.nodes;
+            if (!stage_ver(k).last_stage()) {
+                a.out_clock = b.out_clock;
+                a.out_scope = b.out_scope;
+                if (b.out_ticks > 0) a.v[kTlOutTicks].push_back((double) b.out_ticks);
+                if (b.out_ms >= 0) a.v[kTlOutEst].push_back(b.out_ms);
+                if (b.out_ms < 0) ++a.out_unknown;
+            }
+            a.v[kTlPrep].push_back((double) (b.h_submit - b.h_begin) / 1e6);
+            a.v[kTlSubmit].push_back((double) (b.h_ret - b.h_submit) / 1e6);
+            if (b.dev) {
+                a.v[kTlGpu].push_back((double) (b.d_end - b.d_start) / 1e6);
+                if (a.prev) {
+                    a.v[kTlIdle].push_back((double) ((int64_t) b.d_start - (int64_t) a.dend) / 1e6);
+                    a.v[kTlCycle].push_back((double) ((int64_t) b.d_start - (int64_t) a.dstart) / 1e6);
+                }
+                if (a.off_ok) {
+                    a.v[kTlStart].push_back(((double) b.d_start + a.off - (double) b.h_ret) / 1e6);
+                    a.v[kTlNotice].push_back(((double) b.h_notice - ((double) b.d_end + a.off)) / 1e6);
+                }
+                a.dend = b.d_end;
+                a.dstart = b.d_start;
+                a.prev = true;
+            }
+            a.free_ns = b.h_notice;
+            if (gi >= 0 && gi < (int) tl_ready.size()) tl_ready[(size_t) gi] = b.h_notice;
+        };
+        auto tl_launch = [&](int k, int gi, Clock::time_point t0) {
+            TlAcc& a = tla[(size_t) k];
+            const int64_t ready = gi >= 0 && gi < (int) tl_ready.size() ? tl_ready[(size_t) gi] : 0;
+            if (a.free_ns == 0 || ready == 0) return;
+            a.v[kTlWaitGrp].push_back((double) std::max<int64_t>(0, ready - a.free_ns) / 1e6);
+            a.v[kTlPump].push_back((double) (tl_ns(t0) - std::max(ready, a.free_ns)) / 1e6);
+        };
+        auto tl_report = [&] {
+            for (int k = 0; k < n_pipe; ++k) {
+                TlAcc& a = tla[(size_t) k];
+                std::string line;
+                char b[160];
+                const bool out_est = !a.v[kTlOutEst].empty();
+                for (int c = 0; c < kTlCols; ++c) {
+                    std::vector<double>& v = a.v[c];
+                    if (v.empty()) continue;
+                    double sum = 0;
+                    for (double x : v) sum += x;
+                    std::nth_element(v.begin(), v.begin() + (long) (v.size() / 2), v.end());
+                    std::snprintf(b, sizeof b, " %s %.3f/%.3f", tl_names[c], sum / (double) v.size(), v[v.size() / 2]);
+                    line += b;
+                    v.clear();
+                }
+                if (a.out_clock != nullptr) {
+                    std::snprintf(b, sizeof b, " out-clock=%s out-duration=%s out-unknown=%zu out-scope=%s", a.out_clock,
+                                  out_est ? "calibrated-estimate" : "UNKNOWN", a.out_unknown, a.out_scope);
+                    line += b;
+                    a.out_unknown = 0;
+                }
+                std::fprintf(stderr, "strata batch timeline: stage %d (%zu graph nodes, offset %s) mean/median ms:%s\n", k,
+                             a.nodes, a.off_ok ? "ok" : "none", line.c_str());
+            }
+            tl_calibrate();
+        };
+        if (tl_every > 0 && piped) tl_calibrate();
         // one turn: serve every running stage, hand finished groups on, start what can start
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
             if (bt_windows == 0 && !pipe_inflight()) {
                 bt_start = Clock::now();
                 for (int k = 0; k < n_pipe; ++k) pipe_pool0[(size_t) k] = stage_ver(k).ms_pool;
+            }
+            // Copy completion is a group dependency, not a stage-compute dependency.  Keep inflight true during
+            // drain/cancel too: no new request or group wrap may reuse these rows before delivery and consumption.
+            for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                PGroup& G = pg[(size_t) gi];
+                if (G.outbound_stage < 0) continue;
+                const int r = stage_ver(G.outbound_stage).batch_outbound_poll(hbase_of(gi), err);
+                if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
+                if (r == 0) continue;
+                G.stage = G.outbound_stage + 1;
+                G.outbound_stage = -1;
+                // tl_ready is a GROUP-ready time.  The producer's compute-free time remains in tl_done.
+                if (tl_every > 0) tl_ready[(size_t) gi] = tl_ns(Clock::now());
             }
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
@@ -9069,37 +9826,123 @@ int main(int argc, char** argv) {
                 if (pipe_threads) {
                     r = spoll[(size_t) k]->result.load();
                     if (r < 0) err = spoll[(size_t) k]->err;
-                    if (r == 1) spoll[(size_t) k]->result.store(2);
+                    if (r > 0) spoll[(size_t) k]->result.store(3);
                 } else {
                     r = stage_ver(k).batch_poll(win_pool_fn, win_pool_user, err);
                 }
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
+                st_run[(size_t) k] += std::chrono::duration<double, std::milli>(Clock::now() - st_t0[(size_t) k]).count();
+                ++st_n[(size_t) k];
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
+                if (strata::core::Verifier::batch_raw_windows()) {
+                    const auto& b = stage_ver(k).batch_times();
+                    // IDs are stage-local completed-window sequence numbers, never interval samples.
+                    // Device clocks are comparable only within a stage. Missing timing is null, not zero.
+                    std::fprintf(stderr, "[strata-batch-window] {\"version\":1,\"stage_id\":%d,\"window_id\":%lld,"
+                                         "\"group_id\":%d,\"rows\":%d,\"duration_unit\":\"ns\","
+                                         "\"duration_clock\":\"device_timer\",\"duration_ns\":",
+                                 k, (long long) st_n[(size_t) k], gi, b.rows);
+                    if (b.dev && b.d_end >= b.d_start)
+                        std::fprintf(stderr, "%llu", (unsigned long long) (b.d_end - b.d_start));
+                    else std::fputs("null", stderr);
+                    std::fprintf(stderr, ",\"host_duration_ns\":%lld,\"host_clock\":\"steady_clock\","
+                                         "\"scope\":\"stage_graph_and_commit\"}\n",
+                                 (long long) (b.h_notice - b.h_begin));
+                }
+                if (tl_every > 0) {
+                    tl_done(k, gi);
+                    if (k + 1 == n_pipe && ++tl_steps % tl_every == 0) tl_report();
+                }
+                // window-row prefill: a reading slot whose window ended at its turn checkpoint saves this stage's
+                // part of it now (this stage's GPU runs no window of its own until the next launch)
+                for (int t = 0; wp_on && t < G.S; ++t) {
+                    if (G.kind[t] != 2 || !G.cutnow[t]) continue;
+                    BSlot& sl = bs[(size_t) (gi * GS + t)];
+                    if (sl.cut_bad) continue;
+                    sl.cut_parts.resize((size_t) n_pipe);
+                    const std::vector<int32_t> upto(sl.prompt.begin(), sl.prompt.begin() + sl.cut);
+                    std::string e;
+                    if (!wp_save(gi * GS + t, k, upto, sl.cut_parts[(size_t) k], e)) {
+                        std::fprintf(stderr, "strata batch: slot %d: its turn checkpoint (stage %d) was not saved: %s\n",
+                                     gi * GS + t, k, e.c_str());
+                        sl.cut_bad = true;
+                    }
+                }
+                if (r == 2) {   // packed rows survive independently; this stage can compute another group now
+                    G.stage = -1;
+                    G.outbound_stage = k;
+                    G.since = pipe_tick;
+                    continue;
+                }
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 const int32_t* outb = stage_ver(k).batch_out();   // the last stage: the group's picks
                 for (int t = 0; t < G.S; ++t) {
                     const int b = gi * GS + t;
                     BSlot& sl = bs[(size_t) b];
-                    if (!sl.active) continue;
-                    const int32_t y = outb[t];
+                    // (window-row prefill admits a slot while its group is in flight: it was a pad row of this one)
+                    if (!sl.active || G.kind[t] == 0) continue;
+                    if (G.kind[t] == 2) {   // window-row prefill: its prompt rows are in the slot's sessions now
+                        const int kp = G.keep[t];
+                        sl.ids.insert(sl.ids.end(), sl.prompt.begin() + (std::ptrdiff_t) sl.ids.size(),
+                                      sl.prompt.begin() + (std::ptrdiff_t) sl.ids.size() + kp);
+                        wp_rows += kp;
+                        wp_pad += G.nrow[t] - kp;
+                        if (G.cutnow[t] && !sl.cut_bad && (int64_t) sl.ids.size() == sl.cut) {
+                            ConvCheckpoint ck = std::move(sl.cut_parts[0]);
+                            ck.origin = ++origin_clock;
+                            for (int s2 = 1; s2 < n_pipe; ++s2) ck.stage_parts.push_back(std::move(sl.cut_parts[(size_t) s2]));
+                            sl.checks.assign(1, std::move(ck));
+                        }
+                        if (G.cutnow[t]) sl.cut_parts.clear();
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        if (sl.stop) {   // stopped while reading: nothing generated; it holds what it read
+                            std::printf("BDONE %d 0 cancel %.1f\n", b, ms);
+                            sl.active = sl.prefill = false;
+                            sl.cached = o.prompt_cache > 0 && !sl.tainted;
+                            continue;
+                        }
+                        if (sl.ids.size() < sl.prompt.size()) continue;
+                        const int32_t y = outb[G.first[t] + kp - 1];   // its last prompt row's pick: the first token
+                        sl.prefill = false;
+                        sl.produced = 1;
+                        std::printf("BT %d %d\n", b, (int) y);
+                        ++bt_rows;
+                        std::fprintf(stderr, "strata batch: slot %d read %lld prompt tokens in its windows (%lld reused), "
+                                             "first token in %.1f ms\n", b,
+                                     (long long) ((int64_t) sl.prompt.size() - sl.reused), (long long) sl.reused, ms);
+                        const int64_t n = (int64_t) sl.prompt.size();
+                        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        const char* fin = eos ? "stop" : sl.produced >= sl.max_new ? "length"
+                                        : n + 1 > slot_cells(o, b) ? "length" : nullptr;
+                        if (fin != nullptr) {
+                            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                            sl.active = false;
+                            sl.cached = o.prompt_cache > 0 && !sl.tainted;
+                        } else {
+                            sl.x = y;
+                            sl.p = n;
+                        }
+                        continue;
+                    }
+                    const int32_t y = outb[G.first[t]];
                     sl.ids.push_back(sl.x);    // the window fed it: the slot's session holds it now
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                                    : sl.p + 2 > slot_cells(o, b) ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         // a pipelined slot is a cache again, so a request left alone in its slot goes back to the
                         // solo path with its drafts (upstream fc844436, #857): its state is final once its last window
-                        // has left the last stage, and a later group window whose pad row writes it clears the flag
-                        // where the group starts
-                        sl.cached = o.prompt_cache > 0 && !sl.img;
+                        // has left the last stage; a later group window gives it a pad row that leaves it alone
+                        // (window_prefill::pad_row), or, where that cannot be, clears the flag where the group starts
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // (#879, as batch_step)
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -9128,13 +9971,27 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
-                    G.S = 0;
-                    for (int t = 0; t < GS; ++t) if (bs[(size_t) pick * (size_t) GS + (size_t) t].active) G.S = t + 1;
-                    for (int t = 0; t < G.S; ++t) {
-                        BSlot& sl = bs[(size_t) pick * (size_t) GS + (size_t) t];
-                        G.tok[t] = sl.active ? sl.x : 0;
-                        G.pos[t] = sl.active ? sl.p : 0;
-                        if (!sl.active) sl.cached = false;   // its pad row writes its state
+                    if (!wp_on) {
+                        G.S = 0;
+                        for (int t = 0; t < GS; ++t) if (bs[(size_t) pick * (size_t) GS + (size_t) t].active) G.S = t + 1;
+                        for (int t = 0; t < G.S; ++t) {
+                            const int b = pick * GS + t;
+                            BSlot& sl = bs[(size_t) b];
+                            const strata::program::window_prefill::PadRow pad =
+                                sl.active ? strata::program::window_prefill::PadRow{} : idle_row(b);
+                            G.tok[t] = sl.active ? sl.x : 0;
+                            G.pos[t] = sl.active ? sl.p : pad.pos;
+                            if (pad.writes_slot && !sl.active) sl.cached = false;   // its row writes its state
+                            G.rows[t] = b;
+                            G.first[t] = t;
+                            G.nrow[t] = 1;
+                            G.keep[t] = G.keepv[(size_t) b] = pad.keep;
+                            G.kind[t] = sl.active ? 1 : 0;
+                            G.cutnow[t] = false;
+                        }
+                        G.R = G.S;
+                    } else if (!wp_plan(pick, G)) {
+                        return false;
                     }
                     G.inflight = true;
                     G.stage = 0;
@@ -9143,10 +10000,19 @@ int main(int argc, char** argv) {
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
-                if (!stage_ver(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
+                const Clock::time_point tl = Clock::now();
+                for (int t = 0; wp_on && t < G.S; ++t) {   // a reading slot's first window: this stage's part set up
+                    BSlot& sl = bs[(size_t) (pick * GS + t)];
+                    if (G.kind[t] != 2 || (sl.setup_left >> k & 1u) == 0) continue;
+                    if (!wp_setup_stage(pick * GS + t, k)) return false;
+                }
+                if (!stage_ver(k).batch_launch_rows(G.rows, G.R, hbase_of(pick), G.tok, G.pos, G.keepv.data(), err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
+                st_t0[(size_t) k] = Clock::now();
+                st_launch[(size_t) k] += std::chrono::duration<double, std::milli>(st_t0[(size_t) k] - tl).count();
+                if (tl_every > 0) tl_launch(k, pick, tl);
                 stage_group[(size_t) k] = pick;
                 if (pipe_threads) {   // the stage's thread serves the window from here
                     StagePoll& sp = *spoll[(size_t) k];
@@ -9166,12 +10032,37 @@ int main(int argc, char** argv) {
                              "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = %.1f "
                              "rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * (double) bt_rows / std::max(wall, 1e-9));
+                if (wp_on)
+                    std::fprintf(stderr, "strata batch (pipelined): window-row prefill: %lld admissions, %lld prompt rows "
+                                         "(%.1f rows/s) + %lld pad rows in the windows\n", (long long) wp_admits,
+                                 (long long) wp_rows, 1000.0 * (double) wp_rows / std::max(wall, 1e-9), (long long) wp_pad);
+                if (shp_on)
+                    std::fprintf(stderr, "strata batch (pipelined): shared prefix: %lld learned cuts, %lld request-path "
+                                         "starts from a slot, %lld window starts from another slot's root, %zu roots "
+                                         "held\n", (long long) shp_learned, (long long) shp_from_slot,
+                                 (long long) shp_window, shp_roots.size());
+                if (slot_park_settings().on)
+                    std::fprintf(stderr, "strata batch (pipelined): slot park: %lld idle slots' conversations written "
+                                         "before reuse (since the start)\n", (long long) slot_parks);
+                wp_rows = wp_pad = wp_admits = 0;
                 // the host thread serves every stage's CPU experts in turn: how much of the wall time that took
                 std::string pools;
                 for (int k = 0; k < n_pipe; ++k)
                     pools += " " + std::to_string((int) (stage_ver(k).ms_pool - pipe_pool0[(size_t) k])) + " ms";
                 std::fprintf(stderr, "strata batch (pipelined): CPU experts per stage:%s of %.0f ms\n", pools.c_str(),
                              wall);
+                for (int k = 0; k < n_pipe; ++k) {   // host-clocked: what a stage's window costs, and how busy it was
+                    const double n = (double) std::max<int64_t>(st_n[(size_t) k], 1);
+                    std::fprintf(stderr, "strata batch (pipelined): stage %d: %lld windows, launch %.2f ms + run %.2f ms "
+                                         "each, busy %.0f%% of the wall\n", k, (long long) st_n[(size_t) k],
+                                 st_launch[(size_t) k] / n, st_run[(size_t) k] / n,
+                                 100.0 * (st_launch[(size_t) k] + st_run[(size_t) k]) / std::max(wall, 1e-9));
+                    st_launch[(size_t) k] = st_run[(size_t) k] = 0.0;
+                    st_n[(size_t) k] = 0;
+                }
+                for (int k = 0; k < n_pipe; ++k)   // STRATA_VERIFY_PROFILE=1: each stage's device time per window phase
+                    if (const std::string pr = stage_ver(k).profile_report(); !pr.empty())
+                        std::fprintf(stderr, "strata batch (pipelined): stage %d profile:%s\n", k, pr.c_str());
                 if (pipe_threads) {   // stage 1's routing counts go back to the one the adaptive tier reads
                     for (size_t i = 0; i < drive.d.usage.size() && i < drive1.d.usage.size(); ++i) {
                         drive.d.usage[i] += drive1.d.usage[i];
@@ -9188,6 +10079,120 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // window-row prefill: a BGEN its slot reads in its group's windows (window_prefill.hpp).  1: admitted (DONE and
+        // BADM <slot> 2 said: its first token comes as a BT), 0: the request path reads it (GEN 1, BADM 1)
+        auto window_admit = [&](const std::string& ln) -> int {
+            namespace wp = strata::program::window_prefill;
+            wp::Request rq;
+            std::string why;
+            if (!wp::parse_bgen(ln, rq, why) || rq.slot < 0 || rq.slot >= (int) bs.size()) return 0;
+            const int b = rq.slot;
+            BSlot& sl = bs[(size_t) b];
+            const int64_t n = (int64_t) rq.ids.size();
+            // what the request path does and the windows do not: it answers (or refuses) these itself
+            // (shared prefix: nor a slot other slots still copy their prefix from at their first window)
+            if (sl.active || sl.partial || sl.lent > 0 || nan_flush || kvg.on || strata::kernels::cvec().loaded() ||
+                rq.logprobs >= 0 ||
+                rq.logit_bias || rq.penalties || rq.pin > 0 || rq.img_keys || n + rq.max_new + 8 > o.max_context ||
+                n + rq.max_new + 8 > slot_cells(o, b))
+                return 0;
+            for (const int64_t t : rq.ids)
+                if (t < 0 || t >= n_vocab) return 0;
+            // what the slot holds of it: its conversation or one of its checkpoints (a layer split's parts complete)
+            std::vector<const std::vector<int32_t>*> held;
+            std::vector<size_t> held_at;
+            const bool reuse = o.prompt_cache > 0 && sl.cached && !sl.img && !sl.tainted && sl.cvec;
+            for (size_t i = 0; reuse && i < sl.checks.size(); ++i)
+                if (sl.checks[i].stage_parts.size() == stages.size() && sl.checks[i].imgs.empty()) {
+                    held.push_back(&sl.checks[i].ids);
+                    held_at.push_back(i);
+                }
+            const wp::Prefix pre = reuse ? wp::slot_prefix(rq.ids, sl.ids, true, held) : wp::Prefix{};
+            // shared prefix (STRATA_SHARED_PREFIX): another slot's root - this system prompt and tools as another agent
+            // read them - when it fits the windows where the slot's own start does not, or saves enough rows
+            int src = -1;
+            int64_t src_tokens = 0;
+            for (int h = 0; shp_on && h < (int) bs.size(); ++h) {
+                // (not a slot whose idle row would write its first cell before this one has copied from it)
+                const ConvCheckpoint* r = h == b || idle_row(h).writes_slot ? nullptr : shp_root_of(bs[(size_t) h]);
+                if (r == nullptr || r->stage_parts.size() != stages.size() || !r->imgs.empty() ||
+                    (int64_t) r->ids.size() <= src_tokens ||
+                    !strata::program::shared_prefix::starts((int64_t) r->ids.size(),
+                                                            strata::program::shared_prefix::common_prefix(rq.ids, r->ids), n))
+                    continue;
+                src = h;
+                src_tokens = (int64_t) r->ids.size();
+            }
+            const int64_t wp_max = window_prefill_settings().max_tokens;
+            if (src >= 0 && !strata::program::shared_prefix::window_takes_shared(pre.tokens, src_tokens, n, wp_max, shp))
+                src = -1;
+            if (src < 0 && n - pre.tokens > wp_max) return 0;
+            // slot park: the request path parks the conversation this admission would overwrite, then reads it
+            if (slot_parkable(sl) && (src >= 0 || !slot_continued(sl, rq.ids))) return 0;
+            const int64_t from = src >= 0 ? src_tokens : pre.tokens;
+            BSlot nx;
+            nx.active = nx.prefill = true;
+            nx.max_new = rq.max_new;
+            nx.prompt.assign(rq.ids.begin(), rq.ids.end());
+            nx.reused = from;
+            nx.p = from;
+            nx.since = ++wp_clock;
+            nx.admitted = nx.t0 = Clock::now();
+            if (src >= 0) {   // setup 3: each stage's part copied from slot src's at that stage's launch
+                nx.setup = 3;
+                nx.src = src;
+                nx.src_ck = nx.root = bs[(size_t) src].root;
+                nx.ids = nx.root->ids;
+                ++bs[(size_t) src].lent;
+                ++shp_window;
+            } else if (pre.tokens == 0) {
+                nx.setup = 1;
+            } else if (pre.checkpoint < 0) {   // its sessions hold the start of the prompt: on from there
+                nx.ids = std::move(sl.ids);
+                nx.ids.resize((size_t) pre.tokens);
+                size_t best = sl.checks.size();   // the deepest checkpoint still below it stays
+                for (size_t i = 0; i < sl.checks.size(); ++i) {
+                    const ConvCheckpoint& c = sl.checks[i];
+                    if (c.ids.size() < (size_t) pre.tokens && c.stage_parts.size() == stages.size() &&
+                        (best == sl.checks.size() || c.ids.size() > sl.checks[best].ids.size()) &&
+                        std::equal(c.ids.begin(), c.ids.end(), nx.prompt.begin()))
+                        best = i;
+                }
+                if (best < sl.checks.size()) nx.checks.push_back(std::move(sl.checks[best]));
+            } else {
+                nx.setup = 2;
+                nx.checks.push_back(std::move(sl.checks[held_at[(size_t) pre.checkpoint]]));
+                nx.ids = nx.checks[0].ids;
+            }
+            // its own root stays while the cells below it are kept (setups 0 and 2 keep the first `from` tokens)
+            if (src < 0 && nx.setup != 1 && sl.root != nullptr && (int64_t) sl.root->ids.size() <= from && reuse)
+                nx.root = sl.root;
+            nx.setup_left = nx.setup != 0 ? (n_pipe >= 32 ? ~0u : (1u << n_pipe) - 1u) : 0u;
+            nx.cut = rq.ckpt && o.prompt_cache > 0
+                ? wp::turn_boundary(rq.ids, from, o.turn_token, o.tail_role_token) : -1;
+            sl = std::move(nx);
+            strata::kernels::SamplerParams sp;   // the request path's sampling keys, penalties refused above
+            sp.greedy = rq.temperature <= 0.0f;
+            sp.temperature = rq.temperature;
+            sp.top_p = rq.top_p;
+            sp.top_k = rq.top_k;
+            sp.seed = rq.seed ? rq.seed : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+            sp.min_p = std::clamp(rq.min_p, 0.0f, 1.0f);
+            sp.counter = 0;
+            ver.set_slot_sampling(b, sp);
+            ++wp_admits;
+            // the admission's DONE (nothing generated yet; the prompt's unread part as the tokens read) and BADM 2
+            std::printf("DONE 0 %lld 0.0 0.0 length 0 0 %lld 0 0 0 0 0.0 %lld 0\n", (long long) n, (long long) from,
+                        (long long) (n - from));
+            std::printf("BADM %d 2\n", b);
+            std::fflush(stdout);
+            std::fprintf(stderr, "strata batch: slot %d reads %lld of %lld prompt tokens in its windows (%s%s)\n", b,
+                         (long long) (n - from), (long long) n,
+                         sl.setup == 1 ? "from token 0" : sl.setup == 2 ? "from its checkpoint"
+                         : sl.setup == 3 ? "from the shared prefix of slot " : "on from its conversation",
+                         sl.setup == 3 ? std::to_string(src).c_str() : "");
+            return 1;
+        };
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!try_next_line(line)) {
@@ -9196,11 +10201,16 @@ int main(int argc, char** argv) {
                     if (pipe_threads) std::this_thread::sleep_for(std::chrono::microseconds(20));
                     continue;
                 }
-                // a request reads its prompt through every stage: the groups in flight finish first
-                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
             } else if (!next_line(line)) {
                 break;
             }
+            // window-row prefill: a short prompt goes into its slot's windows, the groups in flight going on
+            if (wp_on && line.rfind("BGEN ", 0) == 0 && window_admit(line) > 0) continue;
+            // a request reads its prompt through every stage: the groups in flight finish first
+            if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
+            // shared prefix: the slots that still copy their prefix from another do it now, before a request may
+            // overwrite that slot (nothing is in flight)
+            if (piped && wp_on && shp_on && line.rfind("BSTOP ", 0) != 0 && !wp_settle_sources()) return 1;
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -9713,6 +10723,11 @@ int main(int argc, char** argv) {
                             (long long) max_new, (long long) o.max_context);
                 continue;
             }
+            if (admit_slot >= 0 && n + admit_max_new + 8 > slot_cells(o, admit_slot)) {   // --slot-context
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds slot %d's context (%lld)\n",
+                            (long long) n, admit_max_new, admit_slot, (long long) slot_cells(o, admit_slot));
+                continue;
+            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -9728,6 +10743,7 @@ int main(int argc, char** argv) {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            tr("request in", n);   // (to "request": the park, the restore and the give-back from a slot)
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -9808,8 +10824,34 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            // (not with a layer split: a slot's state is spread over the GPUs, and copy_from_slot reads one session)
-            if (o.prompt_cache > 0 && req_imgs.empty() && !multi_gpu && !split_same)
+            // (not with a layer split by default: a slot's state is spread over the GPUs; STRATA_SLOT_SPLIT_REUSE=1
+            // has copy_from_slot read every stage's slot session back, so an agent's next turn reads only its delta)
+            // homelab shared prefix (STRATA_SHARED_PREFIX): every slot is a source, a decoding one too (the windows are
+            // drained here), through its checkpoints and its root - another agent's copy of this system prompt and
+            // tools - and a layer split's too (copy_from_slot reads every stage, the checkpoints carry their parts)
+            bool slot_shared = false;   // the source is another conversation's shared prefix (a root or a checkpoint)
+            if (shp_on && o.prompt_cache > 0 && req_imgs.empty() && want_cvec == cvec_cached && !batch_mtp) {
+                shp_prune();
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    const BSlot& sl = bs[(size_t) b];
+                    const strata::program::shared_prefix::SlotState x = shp_slot(sl);
+                    if (!strata::program::shared_prefix::source_ok(x)) continue;
+                    auto consider = [&](const ConvCheckpoint& c) {
+                        if ((int64_t) c.ids.size() <= std::max(resume, slot_tokens) || !c.imgs.empty() ||
+                            c.stage_parts.size() != stages.size() || !starts_with(c.ids, c.imgs) ||
+                            !strata::program::shared_prefix::checkpoint_ok(x, (int64_t) c.ids.size(),
+                                                                           holds_prefix(sl.ids, c.ids)))
+                            return;
+                        slot_source = b;
+                        slot_tokens = (int64_t) c.ids.size();
+                        slot_ck = &c;
+                        slot_shared = true;
+                    };
+                    for (const ConvCheckpoint& c : sl.checks) consider(c);
+                    if (const ConvCheckpoint* r = shp_root_of(sl)) consider(*r);
+                }
+            }
+            if (o.prompt_cache > 0 && req_imgs.empty() && ((!multi_gpu && !split_same) || slot_split_reuse()))
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
@@ -9817,12 +10859,14 @@ int main(int argc, char** argv) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
+                        slot_shared = false;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
                         if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
+                            slot_shared = false;
                         }
                 }
             // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
@@ -9858,15 +10902,42 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            // homelab slot park: the slot this request takes holds another conversation - written out before this
+            // request's copy_to_slot overwrites it (the windows are drained; the slot is idle)
+            if (admit_slot >= 0 && slot_source != admit_slot && slot_parkable(bs[(size_t) admit_slot]) &&
+                !slot_continued(bs[(size_t) admit_slot], ids))
+                park_slot(admit_slot);
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             int64_t in_tokens = 0;
             bool in_live = false;
             const char* in_source = "ram";
+            adopt_parks();
             // --conversation-save: a file goes further than the live session and every parked conversation
-            const auto saved = disk.enabled() ? disk.best(ids, req_imgs, want_cvec)
-                                              : strata::core::ConversationDisk::Match{};
-            if (saved.tokens > std::max(resume, slot_tokens) && saved.tokens > parked.tokens) {
+            auto saved = disk.enabled() ? disk.best(ids, req_imgs, want_cvec) : strata::core::ConversationDisk::Match{};
+            // homelab background park: this conversation's image still waiting for, or in, the writer is taken back
+            // whole (the bytes the file would hold); an older file of it is never read instead.  Only its own next
+            // turn takes it - a sibling sharing a start does not cancel its write.
+            if (park_q) {
+                const auto q = park_q->best(ids, req_imgs, want_cvec);
+                if ((q.live || q.deepest) && q.tokens > std::max(resume, slot_tokens) && q.tokens >= saved.tokens &&
+                    q.tokens > parked.tokens) {
+                    const auto t0 = Clock::now();
+                    if (auto image = park_q->claim(q.id)) {
+                        incoming.emplace(std::move(*image));
+                        in_tokens = q.tokens;
+                        in_live = q.live;
+                        in_source = "slot park queue";
+                        std::fprintf(stderr, "strata batch: slot park: %lld tokens taken back from the background writer "
+                                             "in %.1f ms\n", (long long) q.tokens,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    } else {   // written meanwhile: it is a file now
+                        adopt_parks();
+                        saved = disk.best(ids, req_imgs, want_cvec);
+                    }
+                }
+            }
+            if (!incoming && saved.tokens > std::max(resume, slot_tokens) && saved.tokens > parked.tokens) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t need = disk.load_bytes(saved.index);
                 if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
@@ -9943,8 +11014,22 @@ int main(int argc, char** argv) {
             const size_t park_held = o.conversation_cache_park_gain > 0
                                          ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
                                          : 0;
-            const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
-                                    (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            int park_slot = -1;   // STRATA_PARK_SKIP_SLOT_HELD: a slot (not this request's) that holds `live`
+            if (park_skip_slot_held() && (borrow || !from_live || incoming || slot_source >= 0) && !pin_sibling &&
+                live_ok && !live.empty() && live_imgs.empty())   // only where a park would be tried
+                for (size_t b = 0; b < bs.size() && park_slot < 0; ++b) {
+                    const BSlot& sl = bs[b];
+                    if ((int) b != admit_slot && (sl.cached || sl.active) && !sl.tainted && !sl.img && !sl.partial &&
+                        sl.cvec == cvec_cached && sl.ids.size() >= live.size() &&
+                        std::equal(live.begin(), live.end(), sl.ids.begin()))
+                        park_slot = (int) b;
+                }
+            if (park_slot >= 0)
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (slot %d holds these %zu tokens)\n",
+                             park_slot, live.size());
+            const bool park_worth = park_slot < 0 &&
+                                    (o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain);
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -9993,12 +11078,27 @@ int main(int argc, char** argv) {
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                     }
+                    // shared prefix: the source slot's root under what came over joins the chain too (the main session's
+                    // K/V below it is now a byte copy of that slot's), so the next new agent mounts it with no copy
+                    const ConvCheckpoint* src_root = shp_root_of(bs[(size_t) slot_source]);
+                    if (src_root != nullptr && src_root != slot_ck && (int64_t) src_root->ids.size() < slot_tokens &&
+                        src_root->stage_parts.size() == stages.size()) {
+                        checks.push_back(*src_root);
+                        checks.back().used = ++check_clock;
+                    }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
                         checks.push_back(*slot_ck);   // the main session's chain has it now
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                    }
+                    if (slot_shared) {
+                        ++shp_from_slot;
+                        std::fprintf(stderr, "strata batch: shared prefix: %lld tokens from slot %d (%s, %s)\n",
+                                     (long long) slot_tokens, slot_source,
+                                     bs[(size_t) slot_source].active ? "decoding" : "idle",
+                                     slot_ck == bs[(size_t) slot_source].root.get() ? "its root" : "its checkpoint");
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -10376,13 +11476,80 @@ int main(int argc, char** argv) {
                 while (st + 1 < (int) stages.size() && i / g.n_expert >= stages[(size_t) st + 1]->lb) ++st;
                 return st;
             };
+            // homelab STRATA_REFILL_STAGED (slot_fill.hpp): every GPU's lent slots at once, a later stage's on a thread
+            // of its own.  A transient blob (STRATA_STAGE_LEND_DROP=1: every lent one) goes through that GPU's pinned
+            // bounce buffers, host copies on SlotFiller's threads and the DMAs queued; the others are queued from the
+            // source's memory as `refill` queues them; one wait per GPU.  The slots get the same bytes (slot_fill_parity).
+            auto refill_staged = [&](std::string& e) -> bool {
+                const strata::core::SlotFillSettings& fs = slot_fill_settings();
+                const size_t ng = stages.size() + 1;
+                struct Queued { int32_t slot, layer; const uint8_t* blob; };
+                std::vector<std::vector<strata::core::SlotFiller::Fill>> staged(ng);
+                std::vector<std::vector<Queued>> queued(ng);
+                for (const auto& [i, slot] : lent_now) {   // the source's lookups on this thread only
+                    const auto l = (int32_t) (i / g.n_expert), x = (int32_t) (i % g.n_expert);
+                    const size_t k = (size_t) (stage_at(i) + 1);
+                    if (srcp->transient(l, x)) staged[k].push_back({slot, l, x});
+                    else queued[k].push_back({slot, l, srcp->blob(l, x)});
+                }
+                if (refill_fillers.size() < ng) refill_fillers.resize(ng);
+                // GPU k (0: CUDA0, on this thread's current device; k > 0: stages[k - 1], set on its thread)
+                auto one = [&](size_t k, std::string& ek) -> bool {
+                    strata::core::ExpertCache& c = k == 0 ? xcache : stages[k - 1]->cache;
+                    const strata::core::OnDevice on(k == 0 ? -1 : stages[k - 1]->dev);
+                    // the same drain as `refill`: no prompt scratch copy or kernel may still write a lent slot
+                    if (!strata::gpu::device_sync()) {
+                        ek = std::string("refill: draining prompt scratch failed: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    for (const Queued& q : queued[k])
+                        if (q.blob == nullptr ||
+                            !c.fill_slot_queued(q.slot, q.blob, ek,
+                                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(q.layer)))
+                            return false;
+                    if (!staged[k].empty()) {
+                        if (!refill_fillers[k]) refill_fillers[k] = std::make_unique<strata::core::SlotFiller>();
+                        if (!refill_fillers[k]->fill(*srcp, c, staged[k], fs.buffers, fs.threads, ek)) return false;
+                    }
+                    return queued[k].empty() || c.sync_queued(ek);
+                };
+                std::vector<std::string> errs(ng);
+                std::unique_ptr<char[]> oks(new char[ng]());
+                std::vector<std::thread> ts;
+                for (size_t k = 1; k < ng; ++k)
+                    ts.emplace_back([&, k] { oks[k] = (char) one(k, errs[k]); });
+                oks[0] = (char) one(0, errs[0]);
+                for (std::thread& t : ts) t.join();
+                for (size_t k = 0; k < ng; ++k)
+                    if (!oks[k]) {
+                        e = "refill (staged), GPU part " + std::to_string(k) + ": " + errs[k];
+                        return false;
+                    }
+                for (const auto& [i, slot] : lent_now) host_res[(size_t) i] = slot;
+                if (!res_upload()) {
+                    e = std::string("refill: residency upload failed: ") + strata::gpu::last_error();
+                    return false;
+                }
+                lent_now.clear();
+                lent_chunk = 0;
+                tr("refill done (staged)");
+                return true;
+            };
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
+                if (slot_fill_settings().on) return refill_staged(e);
                 // each GPU's slots on its own queue (lent_now runs CUDA0's first, then each stage's), one wait each
                 for (int st = -1; st < (int) stages.size(); ++st) {
                     strata::core::ExpertCache& c = st < 0 ? xcache : stages[(size_t) st]->cache;
                     const strata::core::OnDevice on(st < 0 ? -1 : stages[(size_t) st]->dev);
+                    // A streamed chunk may leave unrouted tail blobs on the prompt's separate copy queue.
+                    // Its compute wait (and the split futures) does not drain those writes into lent slots.
+                    // Cancellation can leave compute work too: finish every owning queue before overwriting scratch.
+                    if (!strata::gpu::device_sync()) {
+                        e = std::string("refill: draining prompt scratch failed: ") + strata::gpu::last_error();
+                        return false;
+                    }
                     bool any = false;
                     for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                         if (stage_at(i) != st) continue;
@@ -10398,7 +11565,10 @@ int main(int argc, char** argv) {
                     }
                     if (any && !c.sync_queued(e)) return false;
                 }
-                res_upload();
+                if (!res_upload()) {
+                    e = std::string("refill: residency upload failed: ") + strata::gpu::last_error();
+                    return false;
+                }
                 lent_now.clear();
                 lent_chunk = 0;
                 return true;
@@ -10407,7 +11577,10 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (lend_first < 0) return true;                       // its own buffers: nothing to lend
-                const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
+                // (STRATA_BATCH_READ_PIPE, --batch: the read's chunk, about a quarter of it; read_pipe.hpp)
+                const int64_t want = o.batch > 0 ? strata::program::read_pipe::chunk_for(tokens, o.prefill_chunk,
+                                                                                         read_pipe_settings())
+                                                 : std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
                 if (!lent_now.empty()) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
@@ -10440,18 +11613,29 @@ int main(int argc, char** argv) {
                             host_res[i] = strata::core::kNotResident;
                         }
                 }
-                res_upload();
+                if (!res_upload()) {
+                    e = std::string("lend: residency upload failed: ") + strata::gpu::last_error();
+                    return false;
+                }
                 lent_chunk = want;
                 return true;
             };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
             // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
             // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
-            // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
-            // borrowed (marked missing: those experts run on the CPU), never a prompt buffer (#465).
+            // prompt does not stop the others.  By default the slots' windows see the cache without the slots this
+            // prompt borrowed (marked missing: those experts run on the CPU), never a prompt buffer (#465).
+            // STRATA_BATCH_READ_REFILL=1 returns those slots before the decode interval and lends them again for the
+            // next chunk.  It restores all the loan's resident experts, not just those a window might route to; its
+            // refill cost depends on the source (RAM or files), so it stays opt-in, with no assumed cost threshold.
             static const double decode_share = [] {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::strtod(v, nullptr)) : 0.5;
+            }();
+            static const bool batch_read_refill = [] {
+                constexpr bool kBatchReadRefillDefault = false;
+                const char* v = std::getenv("STRATA_BATCH_READ_REFILL");
+                return v != nullptr && v[0] != '\0' ? v[0] != '0' : kBatchReadRefillDefault;
             }();
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
@@ -10472,8 +11656,11 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                // STRATA_BATCH_READ_PIPE (read_pipe.hpp): a call takes several chunks, so the split stages overlap
+                // inside it (stage 0 on chunk i + 1 while stage 1 reads chunk i); between calls the slots decode
+                const strata::program::read_pipe::Settings& rps = read_pipe_settings();
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = strata::program::read_pipe::call_end(q, b0, C, batch_on(), rps);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
@@ -10529,16 +11716,44 @@ int main(int argc, char** argv) {
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
-                    const auto td = Clock::now();
-                    in_prompt_read = true;
-                    do {
-                        if (!batch_step()) {
-                            in_prompt_read = false;
+                    const int64_t return_chunk = batch_read_refill && !lent_now.empty() ? lent_chunk : 0;
+                    if (return_chunk > 0) {
+                        // sp.run has waited for every split stage.  Refill also drains their scratch-copy queues
+                        // before restoring experts and publishing residency; no window may read prompt scratch.
+                        if (!refill(e)) {
                             batch_fatal = true;
-                            e = "a batch window failed";
+                            e = "interleaved decode: refilling read-loaned slots failed: " + e;
                             return false;
                         }
-                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                        tr("interleaved decode: read-loaned slots refilled", (long long) return_chunk);
+                    }
+                    const auto td = Clock::now();
+                    in_prompt_read = true;
+                    if (rps.on && piped) {
+                        // the pipelined groups, as between requests (every slot, the window-row readers too), then
+                        // drained: the next call reads through every stage
+                        bool ok = true;
+                        do {
+                            ok = pump(true);
+                            if (ok && pipe_threads) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        } while (ok && batch_on() &&
+                                 std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                        if (!ok || !pipe_drain()) {
+                            in_prompt_read = false;
+                            batch_fatal = true;
+                            e = "a pipelined batch window failed between the prompt's chunks";
+                            return false;
+                        }
+                    } else {
+                        do {
+                            if (!batch_step()) {
+                                in_prompt_read = false;
+                                batch_fatal = true;
+                                e = "a batch window failed";
+                                return false;
+                            }
+                        } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    }
                     in_prompt_read = false;
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
@@ -10546,6 +11761,17 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata trace: prompt chunk to %lld, then the slots decoded %.0f ms\n",
                                      (long long) q, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         std::fflush(stderr);
+                    }
+                    if (return_chunk > 0) {
+                        // Keep this read's original layout: C was captured before the loop.  A shorter remaining
+                        // tail must not shrink sp.chunk() here, nor any split stage's borrowed region.  Adaptive
+                        // swaps stayed disabled in batch_step; the same experts can safely be lent again.
+                        if (!lend(return_chunk, e)) {
+                            batch_fatal = true;
+                            e = "interleaved decode: re-lending prompt slots failed: " + e;
+                            return false;
+                        }
+                        tr("interleaved decode: prompt slots re-lent", (long long) return_chunk);
                     }
                 }
                 return true;
@@ -10661,9 +11887,28 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
+            // homelab shared prefix (STRATA_SHARED_PREFIX): the longest start this prompt shares with a token sequence
+            // seen (a slot's conversation, the main session's, a parked one) is a branch point other agents come back
+            // to: the read also stops there (aligned to the chunk) and saves a checkpoint, and every checkpoint inside
+            // that common part is marked shared (a slot keeps the deepest one as its root)
+            int64_t shp_common = 0, learn_at = -1;
+            if (shp_on && req_ckpt && req_imgs.empty() && want_cvec == cvec_cached) {
+                // (not this conversation's own earlier state: its slot, or a sequence this prompt simply continues)
+                auto seen = [&](const std::vector<int32_t>& seq) {
+                    const int64_t c = strata::program::shared_prefix::common_prefix(ids, seq);
+                    if (c < (int64_t) seq.size()) shp_common = std::max(shp_common, c);
+                };
+                for (int b = 0; b < (int) bs.size(); ++b)
+                    if (b != admit_slot && !bs[(size_t) b].img) seen(bs[(size_t) b].ids);
+                for (const auto& e : conversations.entries()) if (e.live.imgs.empty()) seen(e.live.ids);
+                if (live_imgs.empty()) seen(live);
+                shp_common = std::min(shp_common, n - 1);
+                learn_at = strata::program::shared_prefix::learned_cut(n, shp_common, read_from, sp.chunk(), shp);
+            }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
+            if (pin_at >= 0 || learn_at >= 0) {
+                if (pin_at >= 0) cuts.push_back(pin_at);
+                if (learn_at >= 0) cuts.push_back(learn_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
@@ -10682,6 +11927,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+                if (!win) tr("lent", (long long) lent_now.size(), to - at);
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 {
@@ -10716,18 +11962,28 @@ int main(int argc, char** argv) {
                 at = to;
                 // the turn boundary's checkpoint (the next request of the chat resumes there) is only staged now and
                 // goes to RAM after the reply (finish_staged)
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at,
-                                   to == turn_at && to != root_at && to != message_at && to != pin_at)) {   // the tail kind leaves first
+                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || to == learn_at) &&
+                    !checkpoint_at(to, nullptr,
+                                   to == message_at && to != turn_at && to != root_at && to != pin_at && to != learn_at,
+                                   to == turn_at && to != root_at && to != message_at && to != pin_at &&
+                                       to != learn_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
+                tr("part done (its checkpoint saved)", to);
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+                if (to == learn_at) {
+                    ++shp_learned;
+                    std::fprintf(stderr, "strata serve: shared prefix: a checkpoint at %lld tokens, the start this "
+                                         "prompt shares with another (%lld)\n", (long long) learn_at, (long long) shp_common);
+                }
             }
+            for (ConvCheckpoint& c : checks)   // shared prefix: the checkpoints inside the part another prompt shares
+                if (shp_common > 0 && (int64_t) c.ids.size() <= shp_common && c.imgs.empty()) c.shared = true;
             const auto tref = Clock::now();
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -11306,7 +12562,7 @@ int main(int argc, char** argv) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                        chain_n = std::min(strata::kernels::kVerifyDefaultT - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
                         chain_kind = 1;
@@ -11335,7 +12591,7 @@ int main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+                            chain_n = strata::kernels::kVerifyDefaultT - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
@@ -11510,6 +12766,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 tr("window", p, T);
+                homelab_profile::Window hp_window(T, 1);
+                homelab_profile::Span hp_run("solo.run_to_accept");
                 const Clock::time_point tw0 = Clock::now();
                 dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -11541,6 +12799,7 @@ int main(int argc, char** argv) {
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
+                hp_run.end();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (adapt_period > 0)
@@ -11553,11 +12812,14 @@ int main(int argc, char** argv) {
                         adapt_ok = adapt();
                         dt_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                     });
+                homelab_profile::Span hp_commit("solo.commit");
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                hp_commit.end();
+                homelab_profile::Span hp_emit("solo.emit_and_bookkeeping");
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -11608,12 +12870,15 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
+                hp_emit.end();
+                homelab_profile::Span hp_draft("solo.mtp_draft");
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
+                    hp_draft.end();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
@@ -11843,6 +13108,17 @@ int main(int argc, char** argv) {
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
                     if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    // shared prefix: the shallowest shared checkpoint of at least the minimum is the slot's root (the
+                    // prefix most agents share - the system prompt and tools - rather than a deep one this conversation
+                    // shares with its own re-rendered turn); its K/V is a byte copy of the main session's, which that
+                    // checkpoint's read wrote
+                    const ConvCheckpoint* root = nullptr;
+                    for (const ConvCheckpoint& c : checks)
+                        if (shp_on && !sl.img && c.shared && c.imgs.empty() && c.ids.size() < live.size() &&
+                            (int64_t) c.ids.size() >= shp.min_tokens && c.stage_parts.size() == stages.size() &&
+                            (root == nullptr || c.ids.size() < root->ids.size()) && holds_prefix(live, c.ids))
+                            root = &c;
+                    if (root != nullptr) sl.root = shp_share(*root);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
@@ -11953,7 +13229,11 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
-        // --conversation-save: the parked conversations, then the live one (the newest file)
+        // --conversation-save: the background park's queue, the parked conversations, then the live one (the newest file)
+        if (park_q) {
+            park_q->drain();
+            adopt_parks();
+        }
         if (disk.enabled()) {
             for (const auto& image : conversations.entries()) save_one(image, "exit");
             if (live_ok && !live.empty()) {

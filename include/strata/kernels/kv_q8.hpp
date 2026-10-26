@@ -42,6 +42,12 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
                         const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
                         int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr);
 
+/// kv_append_q8_steps with row j into its own table entry (qsa.hpp's KvAppendSlots: k/v codes, k_scale/v_scale, page
+/// table; host_* the streamed row's host copy, null when it has none).  `planes` 1: the K plane only (K8V4's K half),
+/// from kcur.
+void kv_append_q8_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, const float* kcur,
+                        const float* vcur, int cur_stride, int n_tok, int planes, const QsaShapes& s, void* stream);
+
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch `[id][kv_head][head_dim]`; the grid is sized by
 /// `max_ids` (capacity), the kernel reads the real count from `step`.
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,

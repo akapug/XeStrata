@@ -6,7 +6,9 @@
 //
 // Work-group shapes and reduction orders are the CUDA kernels'; a warp is a sub-group of 32.  CUDA's __expf and
 // rsqrtf become the precise exp and SYCL's rsqrt; explicit fmaf calls stay fused.
+#include <algorithm>
 #include "strata/kernels/fused_gr.hpp"
+#include "fused_gr_win.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -20,6 +22,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace strata::kernels {
@@ -133,6 +136,7 @@ inline void norm_step(const sycl::nd_item<1>& it, const FusedGrArgs& a, float* x
 }
 
 struct GrMulti {
+    static constexpr int kMax = kFusedGrMaxT;
     FusedGrArgs a[kFusedGrMaxT];
     float* xn;
     int T;
@@ -179,15 +183,35 @@ private:
     sycl::local_accessor<FusedGrArgs, 1> tab_;
 };
 
-template <int T, int COLS>
-sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const float* ssg) {
+// STRATA_HC_Q8_WIN form 1: the established Q8_0 kernels on a window's compact arguments (grw::GrWin, up to
+// kVerifyMaxT tokens in one pass), token k's FusedGrArgs rebuilt from it where they are read
+using grw::GrWin;
+static_assert(kFusedGrQ8WinForms == 2 + grw::kShapes, "a form a shape");
+static_assert(grw::N == N && grw::HC == HC && grw::LR == LR && grw::PR == LR + HC && grw::THREADS == THREADS &&
+                  grw::Q8_RPW == Q8_RPW && grw::Q8_KC == Q8_KC && grw::Q8_ROW_D == Q8_ROW_D && grw::Q8_ROW_U == Q8_ROW_U,
+              "fused_gr_win.hpp's geometry is this file's");
+struct WinTok {
+    explicit WinTok(sycl::handler&) {}
+    template <int Dim> void stage(const GrWin&, const sycl::nd_item<Dim>&) const {}
+    FusedGrArgs operator()(const GrWin& m, int k) const { return m.get(k); }
+};
+template <class M> using TokOf = std::conditional_t<std::is_same_v<M, GrMulti>, TokArgs, WinTok>;
+inline const FusedGrArgs& first(const GrMulti& m) { return m.a[0]; }
+inline FusedGrArgs first(const GrWin& m) { return m.get(0); }
+
+// the tests' choice of the Q8_0 read's launches (fused_gr_q8_set_parts): 1 down, 2 lo (form 2), 4 up
+int g_q8_parts = 7;
+
+template <int T, int COLS, class M>
+sycl::event gr_up_q8(sycl::queue& q, const M& m, const float* part, const float* ssg) {
     static_assert(COLS == 16 || COLS == 32, "a work-group's columns");
+    static_assert(T <= M::kMax && T <= WARP, "a lane a token");
     return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) kFusedGrMaxT * HC), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * COLS), h);
-        sycl::local_accessor<float, 1> mx(sycl::range<1>((size_t) kFusedGrMaxT * COLS), h);
-        const TokArgs tok(h);
+        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) M::kMax * LR / 4), h);
+        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) M::kMax * HC), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) M::kMax * HC * COLS), h);
+        sycl::local_accessor<float, 1> mx(sycl::range<1>((size_t) M::kMax * COLS), h);
+        const TokOf<M> tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) (N / COLS) * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();
@@ -204,7 +228,7 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 if (grp == 0) a.rs[c] = r;
             }
             sycl::group_barrier(it.get_group());
-            const bool injects = m.a[0].w_inject != nullptr;
+            const bool injects = first(m).w_inject != nullptr;
             for (int i = t; i < T * PR; i += THREADS) {
                 const int k = i / PR, r = i - k * PR;
                 if (r >= LR && (grp != 0 || !injects)) continue;
@@ -225,7 +249,7 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
             const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
             for (int r = warp; r < HC * COLS; r += WARPS) {
                 const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
-                const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
+                const uint8_t* qrow = first(m).q8_up + (size_t) i * Q8_ROW_U;
                 const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
                 float4 w[3];
 #pragma unroll
@@ -277,17 +301,18 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
             if constexpr (COLS == 32) {
                 // upstream 0a379a1f's 32-column up: the work-group owns its columns' q8_1 group, so mixed's q8_1
                 // block is written here, a sub-group a token: native_quantize_q8_1's arithmetic on the same values
-                if (m.a[0].q8_mixed != nullptr) {
+                if (first(m).q8_mixed != nullptr) {
                     sycl::group_barrier(it.get_group());
-                    if (warp < T) {
-                        const float xi = mx[warp * COLS + lane];
+                    // a sub-group a token (a window's 16: two each)
+                    for (int kq = warp; kq < T; kq += WARPS) {
+                        const float xi = mx[kq * COLS + lane];
                         float amax = sycl::fabs(xi), sum = xi;
                         for (int o = WARP / 2; o > 0; o >>= 1) {
                             amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
                             sum += sycl::permute_group_by_xor(sg, sum, o);
                         }
                         const float d = xe::q8_1_finite(amax / 127.0f);
-                        uint8_t* blk = static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36;
+                        uint8_t* blk = static_cast<uint8_t*>(tok(m, kq).q8_mixed) + (size_t) (d0 / 32) * 36;
                         blk[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
                         if (lane == 0) {
                             const sycl::half2 ds(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
@@ -300,24 +325,33 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
     });
 }
 
+// kQ8DownGroup: each down launch here (and grw::Down's) takes its work-group as (1, THREADS), the row group (or
+// block) in dimension 0.  The OpenCL CPU device vectorizes along the last dimension, so a (THREADS, 1) group ran
+// there as sub-groups of ONE work-item despite reqd_sub_group_size ("warp" up to 255: rows past LR, reads past
+// q8_down, a segfault; hcx_parity, 2026-10-25).  The groups' linear order and each work-item's local linear id are
+// the (THREADS, 1) launch's, so a GPU runs the same work-groups and sub-groups.
 // STRATA_HC_Q8: the read from the Q8_0 projections (see Q8_RPW above); `part` holds T * Q8_NKC * PR partial dots
 // and then T * Q8_NKC sums of squares.  Another summation order and other weights than the BF16 read.
-template <int T>
-sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned long long* stamp_buf, int stamp_i0) {
+template <int T, class M = GrMulti>
+sycl::event gr_read_q8(sycl::queue& q, const M& m, float* part, unsigned long long* stamp_buf, int stamp_i0) {
     float* ssg = part + (size_t) T * Q8_NKC * PR;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) kFusedGrMaxT * Q8_KC / 4), h);
-        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) WARPS * kFusedGrMaxT), h);
-        const TokArgs tok(h);
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (Q8_RG + 1) * THREADS, Q8_NKC), sycl::range<2>(THREADS, 1)),
+    constexpr int MT = M::kMax;
+    sycl::event e;
+    if (g_q8_parts & 1)
+    e = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) MT * Q8_KC / 4), h);
+        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) WARPS * MT), h);
+        const TokOf<M> tok(h);
+        // (1, THREADS) work-groups: see kQ8DownGroup's note
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (Q8_RG + 1), (size_t) Q8_NKC * THREADS), sycl::range<2>(1, THREADS)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();
-            const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
+            const int t = (int) it.get_local_id(1), lane = (int) sg.get_local_linear_id();
             const int warp = (int) sg.get_group_linear_id();
             const int rg = (int) it.get_group(0), kc = (int) it.get_group(1), c = kc / Q8_CPS;
             const bool inj = rg == Q8_RG;   // the inject rows, the pack's BF16 (the GGUF's are F32 holding BF16)
-            const int nrows = inj ? ((m.a[0].w_inject != nullptr && warp < HC) ? 1 : 0) : Q8_RPW;
+            const int nrows = inj ? ((first(m).w_inject != nullptr && warp < HC) ? 1 : 0) : Q8_RPW;
             const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
             const int sub = lane & 7, bl = lane >> 3;   // lanes 8 bl .. 8 bl + 7: one Q8_0 block, 4 values each
             uint32_t qv[Q8_RPW][Q8_SPB];
@@ -325,7 +359,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
 #pragma unroll
             for (int r = 0; r < Q8_RPW; ++r) {   // the rows' values first, their loads beside the staging below
                 if (inj || r >= nrows) continue;
-                const uint8_t* qrow = m.a[0].q8_down + (size_t) (row0 + r) * Q8_ROW_D;
+                const uint8_t* qrow = first(m).q8_down + (size_t) (row0 + r) * Q8_ROW_D;
                 const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + D);
 #pragma unroll
                 for (int st = 0; st < Q8_SPB; ++st) {
@@ -356,12 +390,12 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
 #pragma unroll
             for (int k = 0; k < T; ++k) {
                 const float v = warp_sum(sg, ssp[k]);
-                if (lane == 0) red[warp * kFusedGrMaxT + k] = v;
+                if (lane == 0) red[warp * MT + k] = v;
             }
             sycl::group_barrier(it.get_group());
             if (rg == 0 && t < T) {
                 float sum = 0.0f;
-                for (int w = 0; w < WARPS; ++w) sum += red[w * kFusedGrMaxT + t];
+                for (int w = 0; w < WARPS; ++w) sum += red[w * MT + t];
                 ssg[t * Q8_NKC + kc] = sum;
             }
             if (nrows == 0) return;
@@ -377,7 +411,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                     float4 w;
                     if (inj) {
                         const sycl::uint2 b = *reinterpret_cast<const sycl::uint2*>(
-                            m.a[0].w_inject + (size_t) row0 * D + (size_t) kc * Q8_KC + v);
+                            first(m).w_inject + (size_t) row0 * D + (size_t) kc * Q8_KC + v);
                         w = float4(sycl::bit_cast<float>(b.x() << 16), sycl::bit_cast<float>(b.x() & 0xffff0000u),
                                    sycl::bit_cast<float>(b.y() << 16), sycl::bit_cast<float>(b.y() & 0xffff0000u));
                     } else {
@@ -403,7 +437,17 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
         gpu_stamp(stamp_buf, stamp_i0, &q);
         gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
     }
-    return m.a[0].q8_mixed != nullptr ? gr_up_q8<T, 32>(q, m, part, ssg) : gr_up_q8<T, 16>(q, m, part, ssg);
+    if (!(g_q8_parts & 4)) return e;
+    return first(m).q8_mixed != nullptr ? gr_up_q8<T, 32>(q, m, part, ssg) : gr_up_q8<T, 16>(q, m, part, ssg);
+}
+
+// form 1: gr_read_q8 on the window's arguments, w.T in [1, kVerifyMaxT]
+template <int... I>
+sycl::event gr_read_q8_win(sycl::queue& q, const GrWin& w, float* part, unsigned long long* sb, int si,
+                           std::integer_sequence<int, I...>) {
+    sycl::event e;
+    (void) ((w.T == I + 1 ? (e = gr_read_q8<I + 1, GrWin>(q, w, part, sb, si), true) : false) || ...);
+    return e;
 }
 
 // Upstream's latency-hidden up projection (gr_fast): 8 lanes a row instead of a sub-group.  Lane j holds the default
@@ -491,15 +535,9 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
     });
 }
 
-}  // namespace
-
-void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
-    if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr)
-        throw core::DeviceError("fused_gr_read_multi: invalid arguments");
-    GrMulti m;
+// every token's arguments, as fused_gr_read_multi takes them
+void check_multi_args(const FusedGrArgs* a, int n_tok) {
     for (int t = 0; t < n_tok; ++t) {
-        m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
         // the BF16 projections, or (STRATA_HC_Q8 with the BF16 copies dropped) the Q8_0 ones alone
         if (!x.R || !x.w_norm || (!(x.w_down && x.w_up) && !x.q8_down) || !x.lo || !x.rs || !x.mixed ||
@@ -510,6 +548,61 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             (x.q8_mixed != nullptr && x.q8_down == nullptr) || (x.q8_mixed == nullptr) != (a[0].q8_mixed == nullptr))
             throw core::DeviceError("fused_gr_read_multi: invalid arguments for token " + std::to_string(t));
     }
+}
+
+// STRATA_HC_Q8_WIN: a window's Q8_0 read (up to kVerifyMaxT tokens) in one pass on its compact arguments (grw::GrWin)
+// instead of passes of kFusedGrMaxT.  0 off (the default); 1 the established kernels in one pass; 2 the rewritten
+// kernels (fused_gr_win.cpp: the partial dots added up once, rows sharing each activation load, reduce-scatter sums) in
+// the shape measured fastest for the window's size; 3.. fixed shapes (grw::read), for hc_read16_parity.  Every form's
+// outputs are the established path's bits (hc_read16_parity).
+constexpr int kHcQ8WinDefault = 0;
+int g_q8_win = -1;   // -1: not yet read from STRATA_HC_Q8_WIN
+
+}  // namespace
+
+void fused_gr_set_q8_win(int form) { g_q8_win = form >= 0 && form < kFusedGrQ8WinForms ? form : kHcQ8WinDefault; }
+int fused_gr_q8_win() {
+    if (g_q8_win < 0) {
+        const char* v = std::getenv("STRATA_HC_Q8_WIN");
+        fused_gr_set_q8_win(v != nullptr ? (int) std::strtol(v, nullptr, 10) : kHcQ8WinDefault);
+    }
+    return g_q8_win;
+}
+void fused_gr_q8_set_parts(int mask) { g_q8_parts = mask & 7; }
+
+void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                         int stamp_i0) {
+    if (n_tok < 1 || n_tok > kVerifyMaxT || xn_scratch == nullptr)
+        throw core::DeviceError("fused_gr_read_multi: invalid arguments");
+    if (a[0].q8_down != nullptr && fused_gr_q8_win() > 0) {
+        if (n_tok > GrWin::kMax) {
+            for (int t = 0; t < n_tok; t += GrWin::kMax)
+                fused_gr_read_multi(a + t, std::min(n_tok - t, GrWin::kMax),
+                                    xn_scratch + (size_t) t * D, stream, stamp_buf, stamp_i0);
+            return;
+        }
+        check_multi_args(a, n_tok);
+        GrWin w;
+        if (grw::pack(a, n_tok, w)) {
+            auto& q = queue_for(stream);
+            const int form = fused_gr_q8_win();
+            const auto e = form == 1 ? gr_read_q8_win(q, w, xn_scratch, stamp_buf, stamp_i0,
+                                                      std::make_integer_sequence<int, GrWin::kMax>{})
+                                     : grw::read(q, w, xn_scratch, form - 2, g_q8_parts, stamp_buf, stamp_i0);
+            if (!stream) core::Runtime::get().wait(e, "fused_gr_read_multi");
+            return;
+        }
+    }
+    if (n_tok > kFusedGrMaxT) {
+        // Keep the established local-memory/workgroup footprint for every device.
+        for (int t = 0; t < n_tok; t += kFusedGrMaxT)
+            fused_gr_read_multi(a + t, std::min(n_tok - t, kFusedGrMaxT),
+                                xn_scratch + (size_t) t * D, stream, stamp_buf, stamp_i0);
+        return;
+    }
+    check_multi_args(a, n_tok);
+    GrMulti m;
+    for (int t = 0; t < n_tok; ++t) m.a[t] = a[t];
     m.xn = xn_scratch;
     m.T = n_tok;
     auto& q = queue_for(stream);
@@ -662,8 +755,9 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // T times the sub-groups (one per row alone left most of it idle) and needs no local staging.
     q.submit([&](sycl::handler& h) {
         const TokArgs tok(h);
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (DOWN_BLOCKS + 1) * THREADS, (size_t) n_tok),
-                                         sycl::range<2>(THREADS, 1)),
+        // (1, THREADS) work-groups: see kQ8DownGroup's note
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (DOWN_BLOCKS + 1), (size_t) n_tok * THREADS),
+                                         sycl::range<2>(1, THREADS)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();

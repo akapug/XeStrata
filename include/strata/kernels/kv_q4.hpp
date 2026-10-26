@@ -56,6 +56,12 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
                         void* stream, const KvHostPools* host = nullptr);
 
+/// kv_append_q4_steps with row j into its own table entry (qsa.hpp's KvAppendSlots: k/v q4_0 blocks, page table;
+/// host_k/host_v the streamed row's host copy, null when it has none).  `planes` 1: the k entries from kcur only
+/// (K8V4's V half: k = the V blocks, kcur = V).
+void kv_append_q4_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, int n_steps, const float* kcur,
+                        const float* vcur, int planes, const QsaShapes& s, void* stream);
+
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given.
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,

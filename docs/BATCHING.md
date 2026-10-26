@@ -60,6 +60,9 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
   The chunks are the ones one uninterrupted read takes, so prefill's arithmetic is unchanged.
 - **A long prompt gives way to a short one**: when a request with a prompt under half as long is waiting, the server sends `BYIELD`.
   At its next chunk boundary the long read stops, the part read so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the same chunks (at most twice per request).
+  Optional `STRATA_BATCH_READ_REQUEUE_MAX_S` sets the queued-age threshold for prioritizing a yielded read; the default `0` keeps the existing order.
+  A positive value prioritizes the oldest overdue read at the next available control-line boundary. Time another read owns the lines counts, and its owner is never preempted.
+  This is neither decode-only time nor a start/finish deadline, and it does not change the yield limit.
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the checkpoint at the prompt's last turn boundary).
   The next turn of that conversation goes to that slot and the engine copies its state back instead of reading the history again.
   This also works for a client that drops the reply's thinking from the history: the checkpoint matches up to the new turn.

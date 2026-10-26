@@ -102,12 +102,18 @@ private:
 class Prefill {
 public:
     /// The CPU expert pool (decode's, idle while a prompt is read).  With STRATA_PREFILL_CPU_SHARE set, a chunk below
-    /// the streamed-walk size hands it the non-resident experts routed by at most MAXT of its tokens, fewest first, up
+    /// the streamed-walk size hands it the non-resident experts routed by at most kShareMaxT of its tokens, fewest first, up
     /// to a share of the experts it would stream (`auto`: measured, where both sides end together); their rows go to
     /// the tail of the experts' outputs (upstream 978d3558).  Not bit-identical to the GPU's rows (the CPU's own
     /// activation format).  Unset (default) or null: every expert on the GPU.  Only for a pool no other thread runs
     /// meanwhile (no batch slots).  Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+
+    /// Opt-in STRATA_PREFILL_STREAM_CPU_SHARE: a fixed fraction of stable non-resident experts is omitted from the
+    /// large-chunk copy stream and computed on the CPU, with all routed rows tiled at MAXT. Only the final split
+    /// stage may borrow decode's pool, after its windows drain; run joins the chain before decode resumes. Separate
+    /// from the short-chunk share above, whose default and numerical behavior stay unchanged. Set before init.
+    void set_stream_cpu_pool(kernels::cpu::ExpertPool* pool) { stream_cpu_pool_ = pool; }
 
     /// A helper GPU's expert cache (RemoteExperts: --expert-cache-device1, or --layer-split auto's helper).  A chunk
     /// below the streamed-walk size hands it the experts this GPU does not hold and it does, routed by at most
@@ -120,6 +126,7 @@ public:
 
 private:
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
+    kernels::cpu::ExpertPool* stream_cpu_pool_ = nullptr;
     struct HelperShare;
     std::unique_ptr<HelperShare> helper_;
 

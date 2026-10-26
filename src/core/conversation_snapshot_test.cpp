@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/conversation_snapshot.hpp"
+#include "conversation_fixture.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -24,95 +25,9 @@
 using namespace strata::core;
 using namespace strata::kernels;
 
+using namespace conversation_fixture;
+
 namespace {
-int checks = 0;
-void check(bool ok, const char* label) {
-    ++checks;
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
-}
-void gpu_check(bool ok) {
-    if (!ok) { std::fprintf(stderr, "GPU: %s\n", strata::gpu::last_error()); std::exit(1); }
-}
-struct Fixture {
-    ModelGeometry g;
-    QsaState state;
-    std::vector<void*> device, host;
-    std::array<void*,5> sources{};
-    std::array<size_t,5> sizes{};
-
-    template<class T> void alloc(T*& p, size_t n, bool pinned = false) {
-        if (!n) return;
-        void* raw = nullptr;
-        // pinned: host USM, which the device addresses directly (the streamed layers' host pools)
-        raw = pinned ? strata::gpu::alloc_host(n) : strata::gpu::alloc_device(n);
-        gpu_check(raw != nullptr);
-        (pinned ? host : device).push_back(raw);
-        p = static_cast<T*>(raw);
-    }
-    Fixture(int fmt, int mode) {
-        auto& st = state;
-        st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
-        st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
-        st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
-        const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim) : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
-        const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
-        sizes = {rows*per, rows*per, fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0,
-                 fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0, (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
-        if (fmt==3) {
-            sizes = {rows*per, rows*kv_q4_bytes_per_head((int)g.head_dim), rows*(g.head_dim/64)*2, 0,
-                     (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
-            alloc(st.k_q,sizes[0]); alloc(st.v_q4,sizes[1]); alloc(st.k_scale,sizes[2]);
-            sources[0]=st.k_q; sources[1]=st.v_q4; sources[2]=st.k_scale;
-        } else if (fmt==kKvQ4) {
-            alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
-            if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
-            sources[0]=mode?st.host.k_q4:st.k_q4; sources[1]=mode?st.host.v_q4:st.v_q4;
-        } else if (fmt==kKvInt8) {
-            alloc(st.k_q,slot_rows*per); alloc(st.v_q,slot_rows*per);
-            alloc(st.k_scale,slot_rows*(g.head_dim/64)*2); alloc(st.v_scale,slot_rows*(g.head_dim/64)*2);
-            if (mode) {
-                alloc(st.host.k_q,sizes[0],true); alloc(st.host.v_q,sizes[1],true);
-                alloc(st.host.k_scale,sizes[2],true); alloc(st.host.v_scale,sizes[3],true);
-            }
-            sources[0]=mode?st.host.k_q:st.k_q; sources[1]=mode?st.host.v_q:st.v_q;
-            sources[2]=mode?st.host.k_scale:st.k_scale; sources[3]=mode?st.host.v_scale:st.v_scale;
-        } else {
-            alloc(st.k_pool,slot_rows*per); alloc(st.v_pool,slot_rows*per);
-            if (mode) {alloc(st.host.k_pool,sizes[0],true); alloc(st.host.v_pool,sizes[1],true);}
-            sources[0]=mode?st.host.k_pool:st.k_pool; sources[1]=mode?st.host.v_pool:st.v_pool;
-        }
-        alloc(st.idx_pooled,sizes[4]); sources[4]=st.idx_pooled;
-        alloc(st.page_table,st.n_pages*4);
-        if (mode==1) {
-            auto& m=st.map;
-            m.page_table=st.page_table; m.n_blocks=st.n_pages; m.n_slots=st.n_slots;
-            alloc(m.slot_block,st.n_slots*4); alloc(m.slot_stamp,st.n_slots*4); alloc(m.slot_ref,st.n_slots*4);
-            alloc(m.miss_block,st.n_slots*4); alloc(m.miss_slot,st.n_slots*4); alloc(m.ctl,size_t{kKvCtlInts}*4);
-        } else if (mode==2) {
-            kv_ring_table(st.page_table,st.n_pages,st.n_slots,nullptr);
-        }
-    }
-    void fill(uint8_t salt) {
-        for (size_t i=0;i<sources.size();++i) {
-            std::vector<uint8_t> data(sizes[i]);
-            for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
-            if (!data.empty()) gpu_check(strata::gpu::copy(sources[i],data.data(),data.size()));
-        }
-    }
-    void fill_after(uint8_t salt, int64_t first_dirty) {
-        for (size_t i=0;i<sources.size();++i) {
-            const size_t offset = i == 4 ? size_t(first_dirty/4)*g.idx_key_dim*4
-                                         : (sizes[i]/size_t(state.max_cells))*size_t((first_dirty/4)*4);
-            if (sizes[i] > offset)
-                gpu_check(strata::gpu::memset(static_cast<uint8_t*>(sources[i])+offset, salt, sizes[i]-offset));
-        }
-    }
-    ~Fixture() { for (void* p:device) strata::gpu::free(p); for (void* p:host) strata::gpu::free(p); }
-};
-bool equal(const ConversationKv& a,const ConversationKv& b) {
-    return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
-}
-
 void full_session(int fmt, int mode, int experts) {
     Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
     auto& g=main.g;
@@ -148,6 +63,91 @@ void full_session(int fmt, int mode, int experts) {
     checkpoint.used = 17;
     checkpoints.push_back(std::move(checkpoint));
     const ConversationView view{ids,images,checkpoints,true};
+    {
+        // homelab STRATA_SLOT_DIRECT_COPY: a batch admission's session -> slot copy without the host image leaves the
+        // slot with the same running state, K/V and PLE window as checkpoint save + restore and K/V save + restore
+        Fixture other(fmt,mode);
+        other.g=g;
+        SessionState slot;
+        slot.max_cells=96; slot.qsa_states=&other.state;
+        other.alloc(slot.gdn_state,sizes.gdn); other.alloc(slot.ple_hist,sizes.ple);
+        other.alloc(other.state.idx_tail,sizes.tail); other.alloc(other.state.idx_dead,sizes.dead);
+        other.alloc(other.state.idx_block_pos,sizes.block_pos);
+        auto junk=[&](uint8_t salt) {
+            other.fill(salt);
+            for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
+                     {slot.gdn_state,sizes.gdn},{slot.ple_hist,sizes.ple},{other.state.idx_tail,sizes.tail},
+                     {other.state.idx_dead,sizes.dead},{other.state.idx_block_pos,sizes.block_pos}})
+                gpu_check(strata::gpu::memset(p,salt,n));
+            gpu_check(strata::gpu::device_sync());
+        };
+        auto capture=[&](ConversationCheckpoint& c, ConversationKv& kv) {
+            c.ids=ids;
+            check(conversation_checkpoint_save(c,slot,g,err) &&
+                  conversation_kv_save(kv,other.state,g,(int64_t)ids.size(),true,err),"capture the slot");
+        };
+        junk(77);
+        ConversationCheckpoint via;
+        via.ids=ids;
+        ConversationKv img;
+        check(conversation_checkpoint_save(via,ss,g,err) && conversation_checkpoint_restore(via,slot,g,err) &&
+              conversation_kv_save(img,main.state,g,(int64_t)ids.size(),true,err) &&
+              conversation_kv_restore(img,other.state,g,(int64_t)ids.size(),true,err),"host-image admission");
+        gpu_check(strata::gpu::device_sync());
+        ConversationCheckpoint want_state, got_state;
+        ConversationKv want_kv, got_kv;
+        capture(want_state,want_kv);
+        const int32_t want_prev[2]={slot.ple_prev[0],slot.ple_prev[1]};
+        junk(91);
+        slot.ple_prev[0]=slot.ple_prev[1]=-7;
+        check(conversation_state_copy(ids,ss,slot,g,err) &&
+              conversation_kv_copy(main.state,other.state,g,(int64_t)ids.size(),true,err),"direct admission");
+        gpu_check(strata::gpu::device_sync());
+        capture(got_state,got_kv);
+        check(got_state.gdn==want_state.gdn && got_state.ple==want_state.ple && got_state.tails==want_state.tails &&
+              got_state.dead==want_state.dead && got_state.block_pos==want_state.block_pos,
+              "direct admission: the same running state");
+        check(equal(got_kv,want_kv),"direct admission: the same K/V and indexer rows");
+        check(slot.ple_prev[0]==want_prev[0] && slot.ple_prev[1]==want_prev[1],"direct admission: the same PLE window");
+        std::vector<int32_t> too_long(97,1);
+        check(!conversation_state_copy(too_long,ss,slot,g,err),"direct admission refuses ids past the session");
+        // homelab STRATA_BATCH_PREFILL: a slot's turn checkpoint put back on a stream of its own leaves what
+        // conversation_checkpoint_restore leaves, and the slot's staged save (on that stream) is its plain save
+        strata::gpu::Stream q = strata::gpu::stream_create();
+        check(q != nullptr,"a stream for the slot's own copies");
+        ConversationCheckpoint turn;
+        turn.ids.assign(ids.begin(),ids.begin()+9);
+        check(conversation_checkpoint_save(turn,ss,g,err),"a turn checkpoint of the main session");
+        junk(51);
+        check(conversation_checkpoint_restore(turn,slot,g,err),"restore it into the slot");
+        ConversationCheckpoint want_turn, got_turn;
+        ConversationKv kv_a, kv_b;
+        capture(want_turn,kv_a);
+        junk(52);
+        slot.ple_prev[0]=slot.ple_prev[1]=-7;
+        check(conversation_checkpoint_restore_on(turn,slot,g,q,err),"restore it on the slot's stream");
+        capture(got_turn,kv_b);
+        check(got_turn.gdn==want_turn.gdn && got_turn.ple==want_turn.ple && got_turn.tails==want_turn.tails &&
+              got_turn.dead==want_turn.dead && got_turn.block_pos==want_turn.block_pos,
+              "stream restore: the same running state");
+        std::vector<uint8_t> spare(sizes.dead);
+        gpu_check(strata::gpu::copy(spare.data(),other.state.idx_pooled+
+                  (turn.ids.size()/strata::kernels::qsa_real_shapes().idx_block)*g.idx_key_dim,sizes.dead));
+        check(spare==turn.dead,"stream restore: the spare indexer row from the dead keys");
+        check(slot.ple_prev[0]==turn.ids[7] && slot.ple_prev[1]==turn.ids[8],"stream restore: the PLE window");
+        ConversationCheckpoint bad=turn;
+        bad.gdn.pop_back();
+        check(!conversation_checkpoint_restore_on(bad,slot,g,q,err),"stream restore refuses a short checkpoint");
+        std::vector<uint8_t> staging(conversation_checkpoint_staged_bytes(slot,g));
+        ConversationCheckpoint staged, plain;
+        staged.ids=ids; plain.ids=ids;
+        check(!staging.empty() && conversation_checkpoint_stage(staging.data(),q,slot,g,ids.size(),err) &&
+              conversation_checkpoint_unstage(staged,staging.data(),slot,g,err) &&
+              conversation_checkpoint_save(plain,slot,g,err),"the slot's staged and plain saves");
+        check(staged.gdn==plain.gdn && staged.ple==plain.ple && staged.tails==plain.tails && staged.dead==plain.dead &&
+              staged.block_pos==plain.block_pos,"staged save: the plain save's bytes");
+        strata::gpu::stream_destroy(q);
+    }
     SavedConversation a,b,restored;
     check(conversation_snapshot_save(a,view,ss,g,draft.state,err),"capture complete A");
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
@@ -297,6 +297,29 @@ int main() {
             gpu_check(strata::gpu::device_sync());
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
+            {
+                // homelab STRATA_SLOT_DIRECT_COPY: session -> session equals save + restore, byte for byte
+                Fixture t(fmt,mode);
+                t.fill(201);
+                gpu_check(strata::gpu::device_sync());
+                check(conversation_kv_copy(f.state,t.state,f.g,upto,index,err),"direct K/V copy");
+                gpu_check(strata::gpu::device_sync());
+                ConversationKv copied;
+                check(conversation_kv_save(copied,t.state,t.g,upto,index,err),"read back the copied K/V");
+                check(equal(a,copied),"direct copy is byte-exact with the captured image");
+                if (mode==1) {
+                    std::vector<int32_t> table((size_t)t.state.n_pages);
+                    gpu_check(strata::gpu::copy(table.data(),t.state.page_table,table.size()*4));
+                    check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),
+                          "direct copy invalidates the destination's stale VRAM pages");
+                }
+                if (fmt==kKvInt8) {
+                    t.state.kv_rot=true;
+                    check(!conversation_kv_copy(f.state,t.state,f.g,upto,index,err),"direct copy refuses a rotation mismatch");
+                    t.state.kv_rot=false;
+                }
+                check(!conversation_kv_copy(f.state,t.state,f.g,-1,index,err),"direct copy refuses an invalid extent");
+            }
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
             check(upto==0 || !equal(a,b),"fixture changes state");

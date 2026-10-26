@@ -45,8 +45,20 @@ namespace strata::core {
 namespace {
 // The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
 // same Intel GPU is listed by OpenCL as well, which the engine does not use.
+// STRATA_TEST_CPU_DEVICE=1: the OpenCL CPU device as the engine's device, for the kernels' bitwise parity tests on a
+// box without the GPU (homelab: odie's cards run the server; times there mean nothing).  kTestCpuDeviceDefault: off.
+constexpr bool kTestCpuDeviceDefault = false;
+bool test_cpu_device() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_TEST_CPU_DEVICE");
+        return v != nullptr && v[0] != '\0' ? v[0] != '0' : kTestCpuDeviceDefault;
+    }();
+    return on;
+}
+
 bool engine_backend(const sycl::device& d) {
     const auto b = d.get_backend();
+    if (test_cpu_device()) return b == sycl::backend::opencl && d.is_cpu();
     return b == sycl::backend::ext_oneapi_level_zero || b == sycl::backend::ext_oneapi_cuda ||
            b == sycl::backend::ext_oneapi_hip;
 }
@@ -110,7 +122,8 @@ std::string no_gpu_listed() {
 std::vector<sycl::device> find_devices() {
     std::vector<sycl::device> candidates;
     std::string refused;
-    for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
+    for (const auto& d : sycl::device::get_devices(test_cpu_device() ? sycl::info::device_type::cpu
+                                                                          : sycl::info::device_type::gpu)) {
         if (!engine_backend(d)) continue;
         if (const std::string why = unusable(d); !why.empty()) {
             refused += "; " + d.get_info<sycl::info::device::name>() + " (" + pci_of(d) + "): " + why;
@@ -262,7 +275,8 @@ bool Runtime::measure_marks() {
         }
         return tag - barrier > kMarks * kCostUs;
     } catch (const std::exception&) {
-        return false;
+        // no timestamp on a queue without profiling (the OpenCL CPU device): a tag would fail every event_record
+        return true;
     }
 }
 

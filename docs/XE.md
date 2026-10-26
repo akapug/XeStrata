@@ -238,6 +238,7 @@ The main things carried:
 - GPU kernels for the gate/up of native Q4_0, Q4_1, Q5_0 and Q6_K experts; the CPU experts' AVX-2 i-quant and Q2_0 kernels.
 - Fused kernels with fewer launches in the verify windows and the prefill path (#783 and others).
 - `STRATA_PREFILL_CPU_SHARE=auto` (the default): a short chunk's least-routed experts are computed by the idle CPU pool.
+- `STRATA_PREFILL_STREAM_CPU_SHARE=0..1` (default `0`, opt-in): in the final stage of a GPU layer split under `--serve`, the CPU takes a fixed fraction of a large chunk's non-resident experts, omitting their weights from PCIe transfers. Only stable host weights are selected, in expert-id order; all routed rows are tiled at the CPU pool's capacity. If buffers cannot be reserved first, the GPU stream is kept. The short-chunk share, chunk scheduling and post-read cache restoration are unchanged. The CPU's activation format can produce results different from GPU-only execution.
 - `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
   It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
 - `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (opt-in, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).

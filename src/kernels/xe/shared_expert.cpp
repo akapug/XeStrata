@@ -15,11 +15,14 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/dmmq_dispatch.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_shared_expert
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 #include <stdexcept>
@@ -127,11 +130,117 @@ void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
 bool shared_expert_native_bf16() { return native_bf16; }
 
+// STRATA_SHEXP_TILE: the most rows one pass of the shared expert takes, 8 (the default) or 16 (with STRATA_MMVQ_SLM
+// the window's 16 rows read each matrix once, in three launches instead of six); every row's arithmetic is the same.
+constexpr int kShexpTileDefault = 8;
+static int g_shexp_tile = 0;   // 0: not yet read from STRATA_SHEXP_TILE
+static void check_shexp_tile(int t) {
+    if (t != 8 && t != 16) throw std::invalid_argument("STRATA_SHEXP_TILE must be 8 or 16");
+}
+static int shexp_tile() {
+    if (g_shexp_tile == 0) {
+        const char* v = std::getenv("STRATA_SHEXP_TILE");
+        const int t = v == nullptr || *v == 0 ? kShexpTileDefault : (int) std::strtol(v, nullptr, 10);
+        check_shexp_tile(t);
+        g_shexp_tile = t;
+    }
+    return g_shexp_tile;
+}
+void shared_expert_set_tile(int rows) {
+    check_shexp_tile(rows);
+    g_shexp_tile = rows;
+}
+
+constexpr int kShexpXmxDefault = 0;
+static int g_shexp_xmx = -1;   // STRATA_SHEXP_XMX; -1: not yet read
+void shared_expert_set_xmx(int min_rows) { g_shexp_xmx = min_rows; }
+int shared_expert_xmx_min() {
+    if (g_shexp_xmx < 0) {
+        const char* v = std::getenv("STRATA_SHEXP_XMX");
+        g_shexp_xmx = dmmq::dispatch_min(v && *v ? std::atoi(v) : kShexpXmxDefault,
+                                         std::getenv("STRATA_DMMQ_MIN_ROWS"));
+    }
+    return g_shexp_xmx;
+}
+
+// the shared expert's per-row gate (from the ORIGINAL hidden state) and its multiply, after the down product: true when
+// the combine is left to scale the rows (gate_later)
+static bool shared_gate_tail(sycl::queue& q, int n_tok, const float* x, const uint16_t* x_bf16,
+                             const uint16_t* gate_inp_bf16, float* g, float* out, int64_t n_embd, void* stream,
+                             bool gate_later, bool g_ready) {
+    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    if (native_bf16 && g_ready) {
+        // the router's launch computed the raw gates
+    } else if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
+        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+    } else {
+        for (int t = 0; t < n_tok; ++t) {
+            if (native_bf16) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+            else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
+        }
+    }
+    if (native_bf16 && gate_later) return true;                             // the combine scales the rows
+    if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
+    else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
+    return false;
+}
+
 bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {
-    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
-        throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
+                         int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1, bool x_q8_1_native) {
+    // STRATA_SHEXP_XMX (homelab K1; 0 = off, the default), floored by STRATA_DMMQ_MIN_ROWS (default 7):
+    // from this many rows (at most 16) the gate, up and down
+    // products run in one pass on iq_mmq_decode (each weight block decoded once for all the rows, on the XMX engines):
+    // x in the int8 form in out's space, gate and up, the SwiGLU into that form in the q8_1 scratch, down into out.
+    const int xmx_min = shared_expert_xmx_min();
+    if (xmx_min > 0 && n_tok >= xmx_min && n_tok <= dmmq::kMaxRows && nw.q8_1 && nw.gate_data && nw.up_data && nw.down_data &&
+        stream && n_embd * 9 >= n_ff * 10) {   // the scratch holds n_tok x max(n_embd, n_ff) q8_1: the SwiGLU's form fits
+        auto& q = queue_for(stream);
+        if (iq_mmq_decode_ok(q, nw.gate_type, n_ff, n_embd, n_tok) && iq_mmq_decode_ok(q, nw.up_type, n_ff, n_embd, n_tok) &&
+            iq_mmq_decode_ok(q, nw.down_type, n_embd, n_ff, n_tok)) {
+            const bool xsums = iq_mmq_type_sums(nw.gate_type) || iq_mmq_type_sums(nw.up_type);
+            const bool native_q8 = iq_mmq_decode_native_q8_1();
+            if (native_q8) {
+                const void* xq = x_q8_1_native ? x_q8_1 : nullptr;
+                if (xq == nullptr) {
+                    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+                    xq = nw.q8_1;
+                }
+                iq_mmq_decode_from_q8_1(q, xq, out, n_embd, n_tok, xsums);
+            } else {
+                iq_mmq_quantize(q, x, nullptr, out, n_embd, n_embd, n_tok, xsums, false);
+            }
+            // STRATA_DMMQ_LEAN's pair bit: gate and up in one launch (each its own launch's bits)
+            if (nw.gate_type != nw.up_type || !iq_mmq_decode_pair(q, nw.gate_type, nw.gate_data, nw.up_data, n_ff,
+                                                                  n_embd, out, n_tok, gate, up, n_ff)) {
+                iq_mmq_decode(q, nw.gate_type, nw.gate_data, n_ff, n_embd, out, n_tok, gate, n_ff);
+                iq_mmq_decode(q, nw.up_type, nw.up_data, n_ff, n_embd, out, n_tok, up, n_ff);
+            }
+            if (native_q8) {
+                // Gate/up have consumed out's planar input. Its n_tok*n_embd floats now hold the native SwiGLU;
+                // the shape guard above also bounds this temporary. Ordered launches finish reading it before down.
+                native_swiglu_q8_1(gate, up, out, (int) n_ff, n_tok, stream);
+                iq_mmq_decode_from_q8_1(q, out, nw.q8_1, n_ff, n_tok, iq_mmq_type_sums(nw.down_type));
+            } else {
+                iq_mmq_swiglu_quantize(q, gate, up, nw.q8_1, n_ff, n_tok, iq_mmq_type_sums(nw.down_type));
+            }
+            iq_mmq_decode(q, nw.down_type, nw.down_data, n_embd, n_ff, nw.q8_1, n_tok, out, n_embd);
+            return shared_gate_tail(q, n_tok, x, x_bf16, gate_inp_bf16, g, out, n_embd, stream, gate_later, g_ready);
+        }
+    }
+    if (const int tile = shexp_tile(); n_tok > tile) {   // balanced tiles of at most `tile` rows; each reuses nw's scratch in order
+        const int k = (n_tok + tile - 1) / tile, m = (n_tok + k - 1) / k;
+        const auto* xq = (const uint8_t*) x_q8_1;
+        bool later = false;
+        for (int c = 0; c < n_tok; c += m)
+            later = shared_expert_multi(std::min(m, n_tok - c), x + c * n_embd, x_bf16 ? x_bf16 + c * n_embd : nullptr, nw,
+                                        gate_inp_bf16, gate + c * n_ff, up + c * n_ff, g + c, out + c * n_embd, n_embd,
+                                        n_ff, stream, gate_later, g_ready, xq ? xq + (size_t) c * (n_embd / 32) * 36 : nullptr,
+                                        x_q8_1_native);
+        return later;
+    }
+    if (n_tok < 1 || n_tok > shexp_tile() || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
+        throw std::invalid_argument("shared_expert_multi: needs 1..STRATA_SHEXP_TILE tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
     const void* xq = x_q8_1;
     if (xq == nullptr) {
@@ -143,6 +252,7 @@ bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         const char* v = std::getenv("STRATA_LFUSE_PAIR");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
+    MmvqRoleScope role(MmvqRole::shexp_gu);   // the STRATA_MMVQ_SLM rules key on the product's role
     if (!(pair_on && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, xq, gate, up, (int) n_embd, (int) n_ff, n_tok,
                            stream))) {
@@ -160,22 +270,9 @@ bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
+    native_mmvq_set_role(MmvqRole::shexp_down);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && g_ready) {
-        // the router's launch computed the raw gates
-    } else if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
-        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
-    } else {
-        for (int t = 0; t < n_tok; ++t) {
-            if (native_bf16) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-            else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-        }
-    }
-    if (native_bf16 && gate_later) return true;                             // the combine scales the rows
-    if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
-    else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
-    return false;
+    return shared_gate_tail(q, n_tok, x, x_bf16, gate_inp_bf16, g, out, n_embd, stream, gate_later, g_ready);
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
@@ -236,6 +333,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         else s_gemv_q8_0_split(act80, codes, scales, off, y, nin, nout, f, s);
     };
 
+    MmvqRoleScope role(MmvqRole::shexp_gu);   // the STRATA_MMVQ_SLM rules key on the product's role
     if (native_gate || native_up) native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, s);
     if (native_gate)
         native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, s);
@@ -251,6 +349,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // down, with the intermediate quantized to the down weight's own activation contract
     if (native_down) {
         native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, s);
+        native_mmvq_set_role(MmvqRole::shexp_down);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, s);
     } else if (down_form.act_kind == 1) {
         quantize_q8_K(gate, h_q8k, n_ff, s);

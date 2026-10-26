@@ -139,7 +139,14 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
 /// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
 /// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). Legacy activation
 /// contract only; with `expert_set_oracle_q8_0(true)` it falls back to one `s2_expert_vnni_q` per token.
-inline constexpr int MAXT = 8;
+inline constexpr int kExpertTileT = 8;  // established CPU arithmetic tile
+// pool capacity: a verify window's tokens routed to one expert, up to kVerifyMaxT (32, homelab: a no-PCIe-share stage
+// computes its missed experts here); every kernel tiles a group into fixed-eight passes, so a token's rows are the same
+// bits in a group of any size
+inline constexpr int MAXT = 32;
+// a prompt chunk's CPU share (prefill, plain_prompt): experts routed by at most this many of the chunk's tokens go to
+// the pool, the pool's capacity before homelab, so which experts the CPU takes is unchanged by MAXT
+inline constexpr int kShareMaxT = 16;
 /// Plan v0.3 P4: the expert in row ranges, so several threads can share one expert.  `s2_expert_gu_rows` writes
 /// ff[r] = silu(gate_r . x) * (up_r . x) for r in [r0, r1) (of FF); `s2_expert_down_rows` writes out[r] for r in
 /// [r0, r1) (of H) from the intermediate's quantized image.  Together with `act_quant_q8_1(ff, FF, a2)` in

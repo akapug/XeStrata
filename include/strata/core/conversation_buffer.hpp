@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -65,35 +67,13 @@ public:
         return total;
     }
     void resize(size_t n, uint8_t value = 0) {
-        if (n > size_) {
-            const size_t held = size_;
-            const bool growing = held != 0;
-            const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
-            const size_t extend = std::min(n - size_, spare);
-            const size_t extra = n - size_ - extend;
-            segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
-            if (extend) {
-                segments_.back().resize(segments_.back().size() + extend, value);
-                size_ += extend;
-            }
-            while (size_ < n) {
-                const size_t count = std::min(segment_bytes, n - size_);
-                const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
-                Segment segment;
-                segment.reserve(segment_capacity(count, previous, growing, held));
-                segment.resize(count, value);
-                segments_.push_back(std::move(segment));
-                size_ += count;
-                progress_beat();   // upstream #2049: zero-filling fresh pages is slow when the host is paging
-            }
-        } else {
-            while (!segments_.empty() && size_ - segments_.back().size() >= n) {
-                size_ -= segments_.back().size();
-                segments_.pop_back();
-            }
-            if (size_ > n) segments_.back().resize(segments_.back().size() - (size_ - n));
-            size_ = n;
-        }
+        grow_or_cut(n, [value](Segment& segment, size_t count) { segment.resize(count, value); });
+    }
+    // homelab kvib: grows like resize but leaves the new bytes as they come from the allocator (not zeroed): for a
+    // caller that writes every one of them next (a conversation read back from its file), which then touches each page
+    // once instead of twice.  Shrinking is resize's.
+    void resize_for_overwrite(size_t n) {
+        grow_or_cut(n, [](Segment& segment, size_t count) { segment.resize(count); });
     }
     void pop_back() { resize(size_ - 1); }
 
@@ -126,7 +106,48 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // value-initialises only when asked (resize's fill value); a bare resize(count) leaves the bytes unwritten
+    template<class T> struct DefaultInit : std::allocator<T> {
+        template<class U> struct rebind { using other = DefaultInit<U>; };
+        DefaultInit() = default;
+        template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
+        template<class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+        template<class U, class... A> void construct(U* p, A&&... a) {
+            ::new (static_cast<void*>(p)) U(std::forward<A>(a)...);
+        }
+    };
+    using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
+    template<class Fill> void grow_or_cut(size_t n, Fill fill) {
+        if (n > size_) {
+            const size_t held = size_;
+            const bool growing = held != 0;
+            const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
+            const size_t extend = std::min(n - size_, spare);
+            const size_t extra = n - size_ - extend;
+            segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
+            if (extend) {
+                fill(segments_.back(), segments_.back().size() + extend);
+                size_ += extend;
+            }
+            while (size_ < n) {
+                const size_t count = std::min(segment_bytes, n - size_);
+                const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                Segment segment;
+                segment.reserve(segment_capacity(count, previous, growing, held));
+                fill(segment, count);
+                segments_.push_back(std::move(segment));
+                size_ += count;
+                progress_beat();   // upstream #2049: zero-filling fresh pages is slow when the host is paging
+            }
+        } else {
+            while (!segments_.empty() && size_ - segments_.back().size() >= n) {
+                size_ -= segments_.back().size();
+                segments_.pop_back();
+            }
+            if (size_ > n) segments_.back().resize(segments_.back().size() - (size_ - n));
+            size_ = n;
+        }
+    }
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

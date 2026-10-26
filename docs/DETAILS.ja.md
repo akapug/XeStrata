@@ -685,6 +685,8 @@ print(r.choices[0].message.content)
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
   エンジンは持っている状態から続けるので、何も読み直しません。
   締めの行は、クライアントから見える思考の一部で、出力のトークンに数えます。
+  server の起動時に環境変数 `STRATA_REASONING_WRAP_UP` を設定すると、締めの文を置き換えます。
+  未設定または空なら既定の文のままで、前後の改行と `</think>` は変わりません。
   `xestrata-<model>.json` に `"reasoning_budget_tokens": N` を書くと、すべての要求に効きます。
   要求自身の値が優先し、`0` は上限なしです。
   既定はオフです。Anthropic の `"thinking": {"budget_tokens": N}` は、上のとおり深さを選び、同時に上限にもなります（同じ要求の `reasoning_budget_tokens` が優先します）。

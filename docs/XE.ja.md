@@ -221,6 +221,7 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
 - ネイティブのエキスパートの Q4_0、Q4_1、Q5_0、Q6_K の gate/up の GPU カーネル。CPU のエキスパートの AVX-2 の i-quant と Q2_0 のカーネル。
 - 検証の窓と prefill の経路で起動の数を減らすカーネルの融合（#783 ほか）。
 - `STRATA_PREFILL_CPU_SHARE=auto`（既定）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
+- `STRATA_PREFILL_STREAM_CPU_SHARE=0..1`（既定 `0`、opt-in）: `--serve` の GPU 層分割の最終段で、大きいチャンクの非常駐エキスパートの固定割合を CPU が受け持ち、その重みを PCIe で転送しません。安定したホスト側の重みだけをエキスパート ID 順に選び、全ルーティング行を CPU プールの上限ごとに分割します。バッファを先に確保できないと GPU のストリームを維持します。短いチャンクの分担、chunk scheduling、読み終わった後のキャッシュの復元は変えません。CPU の活性形式により GPU だけの結果と異なる場合があります。
 - `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
   デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
 - `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in）。

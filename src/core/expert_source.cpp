@@ -1303,12 +1303,22 @@ bool FileExpertSource::pin_cache_complement(
         } else (void) strata::gpu::free(arena);
         arena = nullptr;
     };
+    // STRATA_HOST_PIN_MAX_GIB: a copy the cap cannot take is made pageable here, rather than pinned in parts that the
+    // cap refuses one by one (each try pinning and freeing up to the cap)
+    if (const uint64_t cap = strata::gpu::host_pin_max_bytes(); lock && bytes > 0 && cap > 0 &&
+                                                                strata::gpu::host_pinned_bytes() + bytes > cap) {
+        std::fprintf(stderr, "FileExpertSource: the %.2f GiB copy is not page-locked: STRATA_HOST_PIN_MAX_GIB caps host "
+                             "pins at %.2f GiB and %.2f GiB are pinned already\n",
+                     (double) bytes / 1073741824.0, (double) cap / 1073741824.0,
+                     (double) strata::gpu::host_pinned_bytes() / 1073741824.0);
+        lock = false;
+    }
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);
         if (lock) {
-            const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
+            const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes, "expert-complement");
             if (allocated == true) {
                 void* alias = nullptr;
                 const bool aliased = strata::gpu::device_pointer(&alias, arena);
@@ -1349,7 +1359,7 @@ bool FileExpertSource::pin_cache_complement(
                         ComplementChunk c{start, at, nullptr, nullptr};
                         void* h = nullptr;
                         void* d = nullptr;
-                        ok = strata::gpu::alloc_host(&h, (size_t) (at - start));
+                        ok = strata::gpu::alloc_host(&h, (size_t) (at - start), "expert-complement");
                         if (ok) c.host = (uint8_t*) h;
                         ok = ok && strata::gpu::device_pointer(&d, h) && d != nullptr;
                         if (h != nullptr) got.push_back(c);
@@ -1539,6 +1549,13 @@ bool FileExpertSource::pin_cache_complement(
                      (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
                      stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
     }
+    if (pinned_ok) {   // what the pool holds (host_pin_report): stage-lend and lend-region experts are in VRAM too
+        char held[200];
+        std::snprintf(held, sizeof held, "%lld experts, of them %lld stage-lend copies of VRAM experts (%.2f GiB) and "
+                                         "%lld lend-region copies", (long long) resident_count(), (long long) stage_lent,
+                      (double) stage_lent_bytes / 1073741824.0, (long long) (lend ? n_slots - keep_from : budget_lent));
+        strata::gpu::host_pin_detail("expert-complement", held);
+    }
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
                      additional_gpu_pairs.size());
@@ -1591,7 +1608,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
                           complement_chunks_.empty();
     const size_t total = eligible ? (size_t) rotate_total : (size_t) n * (size_t) blob;
     void* p = nullptr;
-    if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
+    if (strata::gpu::alloc_host(&p, total, "expert-exchange") == true && p != nullptr) {
         xstage_pinned_ = true;
     } else {
 
@@ -1944,7 +1961,7 @@ namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`) are fixed
 // arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is refused at
 // run time rather than written past them (upstream 64cfe3c)
-constexpr int64_t kMaxWindowEntries = 128;
+constexpr int64_t kMaxWindowEntries = (int64_t) strata::kernels::cpu::MAXT * 10;
 static_assert((int64_t) strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 

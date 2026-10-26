@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/window_capacity.hpp"
+
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -41,5 +44,25 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
 /// values T ple_history_advance calls leave), for a verify window's commit (upstream 2e4ddf6e).
 void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                                    float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
+
+/// homelab: a batch window's rows, each its own slot's history (row runs of one slot are contiguous).  Run j covers rows
+/// [first[j], first[j] + ntok[j]) and reads and advances hist[j] (9 x 10240, row-fastest).  By value: 32 runs are 516
+/// bytes of kernel arguments.
+struct PleSlots {
+    static constexpr int kMax = kVerifyMaxT;
+    float* hist[kMax];
+    int32_t first[kMax];
+    int32_t ntok[kMax];
+    int32_t n = 0;
+};
+/// STRATA_BATCH_PLE_SLOTS: the post-ops of T rows whose histories are the runs' slots', in 7 launches.  Row t's
+/// arithmetic, its history advance (none where keep[t] == 0, a pad row) and its snapshot (snap + t x 9 x 10240, the
+/// history after the row) are those of the per-row loop it replaces: native_ple_postops on the row, then
+/// ple_history_advance(hist, normalized, keep + t), then a copy of the history.  `key`, `hidden`, `value`,
+/// `query_norm`, `gated` and `gate` as native_ple_postops_batch's; `keep` may be null (every row advances); `snap` may
+/// be null.
+void native_ple_postops_slots(float* key, float* hidden, const float* value, const PleSlots& slots, const int32_t* keep,
+                              const PleWeights& w, float* query_norm, float* gated, float* gate, int T, float* snap,
+                              void* stream);
 
 } // namespace strata::kernels

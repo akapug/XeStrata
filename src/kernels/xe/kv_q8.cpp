@@ -8,6 +8,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#include "param_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q8
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -81,7 +82,60 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
     if (!stream) core::Runtime::get().wait(e, "kv_append_q8");
 }
 
-void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+void kv_append_q8_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, const float* kcur,
+                        const float* vcur, int cur_stride, int n_tok, int planes, const QsaShapes& s, void* stream) {
+    validate(s, "kv_append_q8_slots");
+    if (n_tok < 1) return;
+    if (n_tok > kQsaSlotsMax || (planes != 1 && planes != 2) || !step)
+        throw core::DeviceError("kv_append_q8_slots: rows, planes or step out of range");
+    for (int j = 0; j < n_tok; ++j)
+        if (!tab.k[j] || !tab.k_scale[j] || !tab.page_table[j] || (planes == 2 && (!tab.v[j] || !tab.v_scale[j])) ||
+            (tab.host_k[j] && (!tab.host_k_scale[j] || (planes == 2 && (!tab.host_v[j] || !tab.host_v_scale[j])))))
+            throw core::DeviceError("kv_append_q8_slots: a row's pools are missing");
+    const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
+    const int groups = head_dim / KV_Q8_GROUP;
+    const KvAppendSlots* t_ = xe::device_table(queue_for(stream), tab);   // by pointer (param_table.hpp)
+    // kv_append_q8_steps' body; row j's codes, scales and page table from its table entry
+    const auto e = queue_for(stream).submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> warp_max(sycl::range<1>(2), hd);
+        hd.parallel_for(sycl::nd_range<3>({(size_t) n_tok * planes, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP},
+                                          {1, 1, KV_Q8_GROUP}),
+                        xe::fits("kv_append_q8_slots", [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int j = (int) it.get_group(0) / planes;
+            const long long pos = (long long) step[(long long) j * step_stride + kStepPos];
+            const int h = (int) it.get_group(2), g = (int) it.get_group(1), t = (int) it.get_local_id(2);
+            const bool is_v = (int) it.get_group(0) % planes == 1;
+            const sycl::sub_group sg = it.get_sub_group();
+            const float x = (is_v ? vcur : kcur)[(long long) j * cur_stride + (long long) h * head_dim + (long long) g * KV_Q8_GROUP + t];
+            float a = sycl::fabs(x);
+            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, sycl::permute_group_by_xor(sg, a, o));
+            if ((t & 31) == 0) warp_max[t >> 5] = a;
+            sycl::group_barrier(it.get_group());
+            const float amax = sycl::fmax(warp_max[0], warp_max[1]);
+            const uint16_t sbits = f16_from_f32(amax / 127.0f);
+            const float sf = f32_from_f16(sbits);                          // quantize against the STORED scale
+            int q = 0;
+            if (sf > 0.0f) {
+                q = (int) sycl::rint(x / sf);
+                q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            }
+            const long long page = (long long) t_->page_table[j][pos / page_size];
+            if (page >= 0) {
+                const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+                static_cast<int8_t*>(is_v ? t_->v[j] : t_->k[j])[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+                if (t == 0) (is_v ? t_->v_scale[j] : t_->k_scale[j])[row * groups + g] = sbits;
+            }
+            if (t_->host_k[j] != nullptr) {
+                const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+                static_cast<int8_t*>(is_v ? t_->host_v[j] : t_->host_k[j])[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+                if (t == 0) (is_v ? t_->host_v_scale[j] : t_->host_k_scale[j])[row * groups + g] = sbits;
+            }
+        }));
+    });
+    if (!stream) core::Runtime::get().wait(e, "kv_append_q8_slots");
+}
+
+void kv_append_q8_step(int8_t* k_q,int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                        const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host) {
     kv_append_q8_steps(k_q, v_q, k_scale, v_scale, page_table, step, 0, kcur, vcur, 0, 1, s, stream, host);

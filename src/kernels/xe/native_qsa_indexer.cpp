@@ -14,6 +14,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/core/runtime.hpp"
+#include "param_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa_indexer
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -206,6 +207,59 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                          relative_pos_device, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail, L.dead[i],
                          L.pooled[i], L.block_pos[i], mc, theta_scale, mtab, scaled, ka, tab);
         });
+    });
+}
+
+void native_qsa_indexer_append_slots(const float* raw, const int32_t* relative_pos_device, int pos_stride,
+                                     int32_t pos_base, const float* gamma, float epsilon, const QsaIndexerSlots& S_,
+                                     const QsaShapes& s, const RopeScaling& scaling, void* stream) {
+    if (S_.n <= 0) return;
+    if (!stream || S_.n > QsaIndexerSlots::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        pos_base < 0 || pos_base % R || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (slots): bad geometry, group count or parameters");
+    for (int j = 0; j < S_.n; ++j) {   // the per-row append's span checks, group by group
+        const int mc = S_.max_cells[j];
+        if (mc < 1 || int64_t(pos_base) + mc > INT32_MAX || S_.first[j] < 0 || S_.ntok[j] < 1 ||
+            S_.first[j] + S_.ntok[j] > QsaIndexerSlots::kMax)
+            throw std::invalid_argument("native QSA indexer (slots): a group's rows or capacity are out of range");
+        const std::size_t pos_span = (std::size_t(S_.first[j] + S_.ntok[j] - 1) * std::size_t(pos_stride) + 1) * 4;
+        const Span spans[] = {{raw + std::size_t(S_.first[j]) * D, std::size_t(S_.ntok[j])*D*4},
+            {relative_pos_device,pos_span},{gamma,std::size_t(D)*4},{S_.tail[j],std::size_t(R-1)*D*4},{S_.dead[j],std::size_t(D)*4},
+            {S_.pooled[j],std::size_t(mc/R+1)*D*4},{S_.block_pos[j],4}};
+        for (const auto& span : spans) validate(span);
+        for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
+            if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
+        if (S_.snap[j] != nullptr) {
+            const Span sn{S_.snap[j], std::size_t(R-1)*D*4};
+            validate(sn);
+            if (overlaps(sn, spans[3])) throw std::invalid_argument("native QSA indexer: the snapshot overlaps the tail");
+        }
+    }
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / ROT);
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(ROT);
+    const RopeTab tab = rope_table_for(scaling);
+    const int32_t* mtab = mrope_table();
+    const QsaIndexerSlots* t_ = xe::device_table(queue_for(stream), S_);   // by pointer (param_table.hpp)
+    queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> values(sycl::range<1>(D), h);
+        sycl::local_accessor<float, 1> partials(sycl::range<1>(32), h);
+        // one work-group a slot group: its tail snapshot, then its rows' appends in order (append_cells)
+        h.parallel_for(sycl::nd_range<1>((size_t) S_.n * THREADS, THREADS),
+                       xe::fits("native_qsa_indexer_append_slots", [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int j = (int) it.get_group(0);
+            float* tail = t_->tail[j];
+            if (t_->snap[j] != nullptr) {
+                for (int i = (int) it.get_local_id(0); i < (R - 1) * D; i += THREADS) t_->snap[j][i] = tail[i];
+                sycl::group_barrier(it.get_group());
+            }
+            const int f = t_->first[j];
+            append_cells(it, &values[0], &partials[0], raw + (std::size_t) f * D,
+                         relative_pos_device + (std::size_t) f * pos_stride, pos_stride, t_->ntok[j], pos_base, gamma,
+                         epsilon, tail, t_->dead[j], t_->pooled[j], t_->block_pos[j], t_->max_cells[j], theta_scale, mtab,
+                         scaled, ka, tab);
+        }));
     });
 }
 

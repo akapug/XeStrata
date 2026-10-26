@@ -192,7 +192,7 @@ class ReplicaEngine:
 
     # not offered: one conversation file / VRAM resize / control line
     NOT_HERE = {"session_file", "vram", "ctl", "slot_cv"}
-    PROPAGATE = {"silence_s", "gpu_busy"}
+    PROPAGATE = {"silence_s", "gpu_busy", "slot_own_wait_s"}
 
     def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS):
         if len(engines) < 2:
@@ -309,7 +309,7 @@ class ReplicaEngine:
         out, base = [], 0
         for k, e in enumerate(self.engines):
             n = int(getattr(e, "batch", 0) or 0)
-            view = e.slots_view() if n and hasattr(e, "slots_view") else \
+            view: list[dict] = e.slots_view() if n and hasattr(e, "slots_view") else \
                 [{"slot": 0, "state": "busy" if self.inflight[k] else "idle", "held_tokens": 0}]
             for s in view:
                 out.append({**s, "slot": base + s["slot"], "replica": k})

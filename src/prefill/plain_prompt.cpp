@@ -601,7 +601,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     std::sort(missed.begin(), missed.end());
                     int64_t rows = 0;
                     for (const auto& [c, e] : missed) {
-                        if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
+                        if (want <= 0 || c > k::cpu::kShareMaxT || rows + c > P.cpu_cap) break;
                         on_cpu[(size_t) e] = 1;
                         cpu_experts.push_back(e);
                         rows += c;

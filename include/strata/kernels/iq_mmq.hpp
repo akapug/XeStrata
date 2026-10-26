@@ -40,6 +40,10 @@ bool iq_mmq_type_dup(int ggml_type);
 /// block sums too (iq_mmq_type_sums), else that part is left unwritten; `dup`: each block twice (rows of 2 cols).
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
                             int64_t rows, bool sums, bool dup = false);
+/// iq_mmq_quantize of the SwiGLU silu(gate) * up, `rows` rows of `cols` values each (homelab K1: the shared expert's
+/// down product on iq_mmq_decode)
+sycl::event iq_mmq_swiglu_quantize(sycl::queue& q, const float* gate, const float* up, void* xq, int64_t cols,
+                                   int64_t rows, bool sums);
 /// The rows iq_mmq_quantize(x, src, ...) writes for `tokens` x `k_used` rows, written token by token: token t's row of
 /// x is quantized once and its blocks stored at rows slot[t * k_used + k] (`slot` the inverse of `src`): the same bytes,
 /// a k_used-th of the quantizations (upstream c675f5b7, llama.cpp's quantize_scatter_mmq_q8_1).
@@ -57,4 +61,45 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t 
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
                            const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
 
+/// Default-off STRATA_DMMQ_NATIVE_Q8_1: dense/shared decode may reuse native quantized operands. Prompt MMQ and HC
+/// never consult it. Quantization and reductions remain distinct quality questions; this is not an output parity claim.
+bool iq_mmq_decode_native_q8_1();
+/// Adapt caller-owned native_quantize_q8_1/native_swiglu_q8_1 blocks to the existing planar decode layout. No allocation;
+/// `native` and `xq` must not overlap, rows in 1..16, cols a positive multiple of 32. The FP16-stored scale is expanded
+/// to FP32; sums (Q4_K/Q5_K) are that scale times the integer codes' sum, NOT native's raw-activation half sum.
+sycl::event iq_mmq_decode_from_q8_1(sycl::queue& q, const void* native, void* xq, int64_t cols, int64_t rows, bool sums);
+
+/// homelab K1 (STRATA_BATCH_DENSE_XMX): a decode window's dense product dst[r, n] = xq[r] . W[n] for 1..16 rows, on
+/// Intel's Xe2 XMX (8 x 16 x 32 int8 on 16 lanes), each weight block decoded once for all the rows.  xq as
+/// iq_mmq_quantize writes it for `rows` rows of w_cols; W [w_rows, w_cols] in the type's blocks (w_rows a multiple of
+/// 16, w_cols a multiple of the type's complete weight block; row-split native layouts need even block counts).
+/// The same quantized operands as iq_mmq_grouped, its sums in another order. Whether it runs for these:
+bool iq_mmq_decode_ok(sycl::queue& q, int ggml_type, int64_t w_rows, int64_t w_cols, int64_t rows);
+/// The K split (1..16; 0: the aim's) and the sub-groups aimed for, in place of STRATA_DMMQ_KS and STRATA_DMMQ_SGS (tests).
+/// A negative value reloads that setting from the environment on the next launch.
+void iq_mmq_decode_set_split(int ks, int sgs);
+sycl::event iq_mmq_decode(sycl::queue& q, int ggml_type, const void* w, int64_t w_rows, int64_t w_cols, const void* xq,
+                          int64_t rows, float* dst, int64_t ld_dst);
+
+/// homelab densefuse, STRATA_DMMQ_LEAN's bits (dmmq_contract.hpp; 0 = off, the default), read once; the setter replaces
+/// them (tests; a negative value reads the environment again on the next call).
+int iq_mmq_decode_lean();
+void iq_mmq_decode_set_lean(int bits);
+/// iq_mmq_decode's products in LeanKernel's form, n = 1 or 2 matrices of one type and shape on one xq (w[i] into
+/// dst[i], ld_dst apart), each with its own launch's K split: iq_mmq_decode's bits.  xmx: Intel's Xe2 tiles (where
+/// iq_mmq_decode_ok); false: the same steps without matrix engines, on any device (the OpenCL CPU device's parity).
+sycl::event iq_mmq_decode_lean_run(sycl::queue& q, int ggml_type, const void* const* w, int n, int64_t w_rows,
+                                   int64_t w_cols, const void* xq, int64_t rows, float* const* dst, int64_t ld_dst,
+                                   bool xmx);
+/// STRATA_DMMQ_LEAN's pair bit: two products of one type and shape on one xq (the shared expert's gate and up) in one
+/// launch, each iq_mmq_decode's bits; false (nothing launched) where the bit is off or iq_mmq_decode does not run.
+bool iq_mmq_decode_pair(sycl::queue& q, int ggml_type, const void* w0, const void* w1, int64_t w_rows, int64_t w_cols,
+                        const void* xq, int64_t rows, float* dst0, float* dst1, int64_t ld_dst);
+/// The K split iq_mmq_decode takes for these (its slices' sum order).
+int iq_mmq_decode_split(int64_t w_rows, int64_t w_cols);
+/// iq_mmq_decode's arithmetic on the host (tests): the same decoded blocks, int32 block sums, scale order and slices.
+void iq_mmq_decode_reference(int ggml_type, const void* w, int64_t w_rows, int64_t w_cols, const void* xq, int64_t rows,
+                             float* dst, int64_t ld_dst);
+
 }  // namespace strata::kernels
+

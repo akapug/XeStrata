@@ -4,6 +4,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/gpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -224,13 +225,19 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
     auto& runtime = Runtime::get();
     for (size_t l = 0; l + 1 < bounds.size(); ++l) {
         const uint64_t n = bounds[l + 1] - bounds[l] + pad;
-        void* p = sycl::malloc_host((size_t) n, runtime.context());
+        const bool admitted = strata::gpu::host_pin_reserve((size_t) n, "expert-arena");
+        void* p = admitted ? sycl::malloc_host((size_t) n, runtime.context()) : nullptr;
         if (!p) {
-            for (uint8_t* q : layer_base) runtime.free(q);
+            if (admitted) strata::gpu::host_pin_cancel((size_t) n);
+            for (uint8_t* q : layer_base) {
+                strata::gpu::host_pin_release(q);
+                runtime.free(q);
+            }
             layer_base.clear();
             throw DeviceError("host USM for the expert arena refused at layer " + std::to_string(l) + " (" +
-                              std::to_string(n) + " B)");
+                              std::to_string(n) + " B)" + (admitted ? "" : std::string(": ") + strata::gpu::last_error()));
         }
+        strata::gpu::host_pin_commit(p, (size_t) n, "expert-arena");
         layer_base.push_back((uint8_t*) p);
         pieces_.emplace_back(p, (size_t) n);
         slice_starts.push_back(bounds[l]);
@@ -454,10 +461,14 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         }();
         const uint64_t avail = ram_available ? ram_available() : UINT64_MAX;   // the caller's reading of the RAM
         const bool room = avail >= n + pad + reserve;
-        void* q = room ? sycl::malloc_host((size_t) (n + pad), runtime.context()) : nullptr;
+        const bool admitted = room && strata::gpu::host_pin_reserve((size_t) (n + pad), "expert-arena");
+        void* q = admitted ? sycl::malloc_host((size_t) (n + pad), runtime.context()) : nullptr;
+        if (admitted && q == nullptr) strata::gpu::host_pin_cancel((size_t) (n + pad));
+        if (q != nullptr) strata::gpu::host_pin_commit(q, (size_t) (n + pad), "expert-arena");
         if (q == nullptr) {   // back as it was: the moved layers into the mapping, then its registrations
             for (size_t k = 0; k < blocks.size(); ++k) {
                 std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
+                strata::gpu::host_pin_release(blocks[k]);
                 runtime.free(blocks[k]);
             }
             try {
@@ -470,7 +481,8 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
                       "again failed (" + e.what() + "): its copies are slower";
                 return false;
             }
-            err = room ? "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)"
+            err = room ? "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)" +
+                             (admitted ? std::string() : std::string(": ") + strata::gpu::last_error())
                    : "the RAM has no room for layer " + std::to_string(l) + " in host USM (" +
                          std::to_string(avail >> 20) + " MiB available)";
             return false;
@@ -584,7 +596,10 @@ PinnedArena::~PinnedArena() {
         }
     }
     if (!layer_base.empty()) {
-        for (uint8_t* p : layer_base) Runtime::get().free(p);
+        for (uint8_t* p : layer_base) {
+            strata::gpu::host_pin_release(p);
+            Runtime::get().free(p);
+        }
         return;
     }
     if (!base) return;

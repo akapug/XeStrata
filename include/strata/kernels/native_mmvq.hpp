@@ -4,6 +4,9 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -15,7 +18,7 @@ namespace strata::kernels {
 // The translation unit must use --use_fast_math, as the pinned CUDA oracle does.
 //
 // Shapes use GGUF order: n_in is the contiguous reduction dimension, n_out is
-// the weight row count, and ncols is the activation column/token count, 1..8
+// the weight row count, and ncols is the activation column/token count, 1..kVerifyMaxT (ordered tiles of at most eight)
 // (plan v0.3 P3). Columns are contiguous: activation column j is x + j * n_in
 // (its Q8_1 blocks at j * n_in / 32) and output column j is y + j * n_out. See
 // native_mmvq_set_multi_exact for how ncols > 1 relates to ncols == 1.
@@ -34,6 +37,39 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
+// Output rows a sub-group (STRATA_MMVQ_ROWS: the 2560-wide rows' layout) or a work-group (STRATA_MMVQ_WG_ROWS: the
+// 6144-wide) takes from STRATA_MMVQ_ROWS_MIN_COLS columns: 1, 2 or 4, each column's activations then read once for that many rows.  Every column stays bitwise its 1-row sum.
+// The process default is STRATA_MMVQ_ROWS (1); the setter is for tests and must precede graph capture.
+void native_mmvq_set_rows(int rows, int wg_rows);
+// The columns one pass takes (STRATA_MMVQ_TILE_COLS, 8 or 16; default 8): every column bitwise either way.
+void native_mmvq_set_tile_cols(int cols);
+// STRATA_MMVQ_SLM (off by default): native_mmvq, native_mmvq_pair and iq_mmvq take the window's columns in one pass
+// with the activations staged in local memory where a rule names the product's role (MmvqRoleScope), its native type
+// and its column count, with that rule's rows a sub-group and sub-groups a work-group (rows / sgs, when non-zero, set
+// every rule's), kb KiB of local memory a work-group and grf registers; every output stays the established kernels'
+// bits (mmvq_slm_parity).  STRATA_MMVQ_SLM_ROLES replaces the rules (native_mmvq_slm_rules' text).
+enum class MmvqRole : int { other, ssm_out, qkv, shexp_gu, shexp_down, any };
+struct MmvqSlmRule { MmvqRole role; int type; int min_cols, max_cols, rows, sgs; };   // type -1: every type
+struct MmvqSlm { bool on = false; int rows = 0, sgs = 0, kb = 36, grf = 256; std::vector<MmvqSlmRule> rules; };
+struct MmvqSlmPick { int rows, sgs, kb, grf; };
+const MmvqSlm& native_mmvq_slm();
+void native_mmvq_set_slm(const MmvqSlm& c);
+// "role:type:min-max:rows:sgs" rules, comma-separated: role other, ssm_out, qkv, shexp_gu, shexp_down or *; type a
+// GGML type number, q6krows, q8rows or *; the first rule that matches decides.  Throws on a malformed rule.
+std::vector<MmvqSlmRule> native_mmvq_slm_rules(const std::string& text);
+// the staged launch's shape for a product of this type and column count in the calling thread's role, or none
+std::optional<MmvqSlmPick> native_mmvq_slm_pick(int type, int ncols);
+// the calling thread's product role (MmvqRole::other until a scope names one); the setter returns the previous one
+MmvqRole native_mmvq_role();
+MmvqRole native_mmvq_set_role(MmvqRole r);
+struct MmvqRoleScope {
+    MmvqRole prev;
+    explicit MmvqRoleScope(MmvqRole r) : prev(native_mmvq_set_role(r)) {}
+    ~MmvqRoleScope() { native_mmvq_set_role(prev); }
+    MmvqRoleScope(const MmvqRoleScope&) = delete;
+    MmvqRoleScope& operator=(const MmvqRoleScope&) = delete;
+};
+int native_mmvq_rows();
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does

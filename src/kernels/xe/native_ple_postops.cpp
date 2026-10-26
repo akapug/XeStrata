@@ -13,6 +13,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "param_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_ple_postops
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -181,11 +182,11 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     native_ple_postops_batch_snap(key, hidden, value, history, w, query_norm, gated, gate_out, T, nullptr, stream);
 }
 
-void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                                   float* query_norm, float* gated, float* gate_out, int T, float* snap, void* stream) {
-    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate_out)
-        throw std::invalid_argument("native PLE postops batch: null input or empty batch");
-    auto& q = queue_for(stream);
+namespace {
+// The rows' arithmetic up to the convolution, row-independent (each row's is native_ple_postops's): the key and query
+// norms, the gate, the gated values and their norm, which ends in query_norm (the rows' conv inputs)
+void batch_prologue(sycl::queue& q, float* key, const float* hidden, const float* value, const PleWeights& w,
+                    float* query_norm, float* gated, float* gate_out, int T) {
     const int rows = T * H;
     const size_t total = size_t(T) * D;
     rms_rep(q, key, w.norm_key, key, rows);
@@ -196,6 +197,16 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
         gated[i] = value[t * N + d % N] * gate_out[t * H + d / N];
     });
     rms_rep(q, gated, w.norm_conv, query_norm, rows);
+}
+}  // namespace
+
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate_out, int T, float* snap, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate_out)
+        throw std::invalid_argument("native PLE postops batch: null input or empty batch");
+    auto& q = queue_for(stream);
+    const size_t total = size_t(T) * D;
+    batch_prologue(q, key, hidden, value, w, query_norm, gated, gate_out, T);
     const uint16_t* weights = w.conv1d_f16;
     // the dilated conv (taps 9, 6, 3 tokens back and this one) and the residual; a tap before the chunk reads the history
     q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
@@ -232,6 +243,49 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
         }
         for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
     });
+}
+
+void native_ple_postops_slots(float* key, float* hidden, const float* value, const PleSlots& slots, const int32_t* keep,
+                              const PleWeights& w, float* query_norm, float* gated, float* gate_out, int T, float* snap,
+                              void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !query_norm || !gated || !gate_out || slots.n <= 0 ||
+        slots.n > PleSlots::kMax)
+        throw std::invalid_argument("native PLE postops slots: null input, empty batch or a bad run count");
+    for (int j = 0, next = 0; j < slots.n; next += slots.ntok[j], ++j)
+        if (!slots.hist[j] || slots.first[j] != next || slots.ntok[j] <= 0 || next + slots.ntok[j] > T ||
+            (j + 1 == slots.n && next + slots.ntok[j] != T))
+            throw std::invalid_argument("native PLE postops slots: the runs must cover rows 0..T in order");
+    auto& q = queue_for(stream);
+    batch_prologue(q, key, hidden, value, w, query_norm, gated, gate_out, T);
+    const uint16_t* weights = w.conv1d_f16;
+    // a work-item a (run, channel): the run's rows in order over the history in registers - each row's conv taps (9, 6
+    // and 3 rows back, then its own), its residual, its advance unless a pad row (keep 0), the snapshot after it - and
+    // the history written back once.  The values and operations of the per-row loop's native_ple_postops conv,
+    // ple_history_advance and snapshot copy.
+    q.parallel_for(sycl::range<2>((size_t) slots.n, (size_t) D),
+                   xe::fits("native_ple_postops_slots", [=](sycl::id<2> id) {
+        const int j = int(id[0]), c = int(id[1]);
+        float* hist = slots.hist[j] + size_t(c) * HISTORY;
+        float h[HISTORY];
+        for (int r = 0; r < HISTORY; ++r) h[r] = hist[r];
+        for (int t = slots.first[j], end = t + slots.ntok[j]; t < end; ++t) {
+            const size_t i = size_t(t) * D + c;
+            float sum = 0;
+            for (int k = 0; k < 4; ++k) {
+                const float x = k == 3 ? query_norm[i] : h[3 * k];
+                const float term = x * f32_from_f16(weights[c * 4 + k]);
+                sum = k == 0 ? term : sum + term;
+            }
+            hidden[i] = hidden[i] + (gated[i] + silu(sum));
+            if (keep == nullptr || keep[t] != 0) {
+                for (int r = 0; r + 1 < HISTORY; ++r) h[r] = h[r + 1];
+                h[HISTORY - 1] = query_norm[i];
+            }
+            if (snap != nullptr)
+                for (int r = 0; r < HISTORY; ++r) snap[size_t(t) * HISTORY * D + size_t(c) * HISTORY + r] = h[r];
+        }
+        for (int r = 0; r < HISTORY; ++r) hist[r] = h[r];
+    }));
 }
 
 }  // namespace strata::kernels

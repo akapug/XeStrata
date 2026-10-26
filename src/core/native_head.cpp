@@ -131,7 +131,7 @@ const void* NativeEmbed::table_for(void* stream) const {
     if (!copies_[(size_t) dev]) {
         const OnDevice on(dev);
         void* c = nullptr;
-        if (!strata::gpu::alloc_host(&c, bytes_))
+        if (!strata::gpu::alloc_host(&c, bytes_, "native-head"))
             throw std::runtime_error("native embedding: cannot pin a copy of " + std::to_string(bytes_ >> 20) +
                                      " MiB for GPU " + std::to_string(dev));
         std::memcpy(c, host_, bytes_);
@@ -163,7 +163,7 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        if (!strata::gpu::alloc_host(&host_, bytes_)) {
+        if (!strata::gpu::alloc_host(&host_, bytes_, "native-head")) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
             return false;

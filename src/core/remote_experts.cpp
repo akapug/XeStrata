@@ -172,9 +172,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         read_stream_ = gpu::stream_create_copy();
         const char* step = stream_ == nullptr                                   ? "stream"
                          : read_stream_ == nullptr                              ? "cache read stream"
-                         : !gpu::alloc_host(&h_x_, rows)                        ? "input staging"
-                         : !gpu::alloc_host(&h_out_, rows)                      ? "result staging"
-                         : !gpu::alloc_host(&h_meta_, sizeof(RemoteMeta))       ? "metadata staging"
+                         : !gpu::alloc_host(&h_x_, rows, "remote-experts")                        ? "input staging"
+                         : !gpu::alloc_host(&h_out_, rows, "remote-experts")                      ? "result staging"
+                         : !gpu::alloc_host(&h_meta_, sizeof(RemoteMeta), "remote-experts")       ? "metadata staging"
                          : !gpu::alloc_device(&d_x_, rows)                      ? "input"
                          : !gpu::alloc_device(&d_out_, rows)                    ? "result"
                          : !gpu::alloc_device(&d_q8_, (size_t) CAP * (H / 32) * 36) ? "activation"

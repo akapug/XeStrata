@@ -54,9 +54,17 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
               int64_t h_k = 16, int64_t h_v = 48);
 /// The recurrence over the chunk, state in registers; y16[t] = rmsnorm(o) * gamma * sigmoid(z) in FP16 (what the
 /// out projection reads; `silu`: * silu(z), qwen35moe's gate); y is FP32 scratch.
+/// STRATA_GDN_CHUNK=1 opts into the named default FP32 chunk-WY path, or 16/32/64
+/// selects its supported chunk shape; unset/0 keeps legacy dispatch. Device or
+/// kernel limits fall back before state writes. This path is not XMX and needs
+/// independent device parity/performance qualification; the output epilogue is
+/// unchanged. Each call commits its final state, including a partial last chunk.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t h_k = 16,
                     int64_t h_v = 48, bool silu = false);
+/// Selected chunk shape for this device/config (0: legacy). Qualification and
+/// attribution query: a fallback must not be reported as a chunk-kernel pass.
+int gdn_recurrence_chunk_size(void* stream, int64_t h_k = 16, int64_t h_v = 48);
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
@@ -76,6 +84,12 @@ void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t 
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// moe_combine followed by gr_write_norm_rs, without materializing bo. All four HC rows share the same
+/// combined values; each row keeps gr_write_norm_rs's element mapping, FMA and reduction order.
+void moe_combine_gr_write_norm_rs(const float* D, const int32_t* slot, const float* weights, const float* shared,
+                                  const float* sg, float* R, const float* inj, int64_t inj_ld, const float* w_norm_next,
+                                  float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
+                                  uint16_t* xn16_lo = nullptr);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

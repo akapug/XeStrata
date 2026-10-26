@@ -34,6 +34,16 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // restore followed by a rewind to a checkpoint.
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool include_index, std::string& error);
+// homelab: session -> session K/V with no host image (a batch slot's admission, STRATA_SLOT_DIRECT_COPY=1): the
+// `upto` tokens' authoritative bytes copied buffer to buffer (device, host USM or plain host alike), then the
+// destination's residency settled as conversation_kv_restore settles it.  Both sessions must carve the same K/V
+// geometry.  Caller synchronizes the device before, and after copying all layers (no sync per layer here).
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
+/// homelab shared prefix: conversation_kv_copy with the copies and the residency reset queued on `stream` (null: as
+/// conversation_kv_copy).  No wait here: the caller waits for the stream (conversation_prefix_copy does).
+bool conversation_kv_copy_on(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                             bool include_index, void* stream, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -67,6 +77,35 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+/// homelab window-row prefill (STRATA_BATCH_PREFILL): conversation_checkpoint_restore as copies queued on `stream` and a
+/// wait for that stream alone, not the device - a batch slot's sessions put back while other slots' windows run on the
+/// card and wait for this host thread.  The caller guarantees nothing else reads or writes `session` meanwhile.
+bool conversation_checkpoint_restore_on(const ConversationCheckpoint& checkpoint, SessionState& session,
+                                        const ModelGeometry& g, void* stream, std::string& error);
+/// homelab (STRATA_SLOT_DIRECT_COPY=1): conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of
+/// `ids` without the host image - the running state (GDN, PLE history, indexer tails/dead keys/block positions) copied
+/// buffer to buffer, the spare indexer row and the PLE token window set as the restore sets them.  Same carve on both
+/// sides.  Caller synchronizes the device before and after (no sync here).
+bool conversation_state_copy(const std::vector<int32_t>& ids, const SessionState& from, SessionState& to,
+                             const ModelGeometry& g, std::string& error);
+/// homelab shared prefix (STRATA_SHARED_PREFIX): `to` starts from the prefix `at` that `from` holds - the K/V of at's
+/// tokens of every owned QSA layer copied session to session (from's authoritative bytes, whole pages), THEN at's
+/// running state put back over it.  The order matters: the copied pooled rows include the moving spare row, which
+/// `from` may have filled with its later tokens, and the restore rebuilds it from at's dead keys.  `at` must be a
+/// checkpoint of `from`'s own history (the same origin as the K/V below it).  `from` is only read.  `stream` null:
+/// copies on the default queue, then a device sync (the caller has synchronized the device before); else every copy
+/// queued on `stream` and a wait for that stream alone (a batch slot set up while other slots' windows run).
+bool conversation_prefix_copy(const ConversationCheckpoint& at, const SessionState& from, SessionState& to,
+                              const ModelGeometry& g, void* stream, std::string& error);
+/// A batch slot's read-back into the main session (generate.cpp copy_from_slot, one session per stage): `to` takes
+/// what `from` holds up to `at` (one of from's own checkpoints), or all of `ids` when `at` is null - the K/V of every
+/// owned QSA layer FIRST, then the running state over it, so the spare indexer row comes from the state (the
+/// checkpoint's dead keys) and never from the later block row `from` filled past `at`.  `direct`
+/// (STRATA_SLOT_DIRECT_COPY): buffer to buffer, else through host images.  The caller has synchronized the device;
+/// this ends with a device sync.  `from` is only read.
+bool conversation_slot_read_back(const ConversationCheckpoint* at, const std::vector<int32_t>& ids,
+                                 const SessionState& from, SessionState& to, const ModelGeometry& g, bool direct,
+                                 std::string& error);
 /// A checkpoint's save in two steps: `stage` copies the running state into `staging` (pinned host memory of
 /// conversation_checkpoint_staged_bytes; the caller has synchronized the device) as one batch of copies on `stream`
 /// and waits for it, `unstage` later fills `checkpoint` (its ids set) from it on the host, as

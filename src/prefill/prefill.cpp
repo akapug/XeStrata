@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/combine_hc.hpp"
+#include "strata/prefill/stream_cpu.hpp"
+#include "strata/prefill/share_rules.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -102,7 +106,7 @@ public:
     void resize(size_t n) {
         if (n > cap_) {
             release();
-            if (!force_pageable() && strata::gpu::alloc_host(&pinned_, n * sizeof(T))) cap_ = n;
+            if (!force_pageable() && strata::gpu::alloc_host(&pinned_, n * sizeof(T), "prefill")) cap_ = n;
             else { pinned_ = nullptr; fallback_.resize(n); cap_ = n; }
         }
         n_ = n;
@@ -298,7 +302,7 @@ struct Stager {
         dma_done.assign((size_t) kRing, nullptr);
         pageable.resize(kRing);
         for (int i = 0; i < kRing; ++i) {
-            pinned[i] = (char) (!force_pageable() && strata::gpu::alloc_host((void**) &buf[i], blob_bytes));
+            pinned[i] = (char) (!force_pageable() && strata::gpu::alloc_host((void**) &buf[i], blob_bytes, "prefill-stager"));
             if (!pinned[i]) {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
@@ -424,7 +428,7 @@ struct PinnedUpload {
             if (ev && !strata::gpu::event_sync(ev)) return;   // keep the old buffer: begin() then falls back
             release();
         }
-        if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t))) {
+        if (!strata::gpu::alloc_host(&p, count * sizeof(int32_t), "prefill")) {
             p = nullptr;
             return;
         }
@@ -743,8 +747,8 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
                 strata::gpu::alloc_device(&hs->hq, mmq::q8_bytes(cap, ff) * 2) &&
                 strata::gpu::alloc_device(&hs->meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
                 strata::gpu::alloc_device(&hs->wtab, (size_t) cap * sizeof(void*)) &&
-                strata::gpu::alloc_host(&hs->h_meta, (size_t) (3 * cap + 1) * sizeof(int32_t)) &&
-                strata::gpu::alloc_host(&hs->h_wtab, (size_t) cap * sizeof(void*));
+                strata::gpu::alloc_host(&hs->h_meta, (size_t) (3 * cap + 1) * sizeof(int32_t), "prefill-helper") &&
+                strata::gpu::alloc_host(&hs->h_wtab, (size_t) cap * sizeof(void*), "prefill-helper");
             if (!ok) { err = std::string("the helper GPU's buffers: ") + strata::gpu::last_error(); return false; }
             for (int64_t i = 0; i < cap; ++i) hs->h_meta[2 * cap + 1 + i] = (int32_t) i;   // the identity
         }
@@ -1100,7 +1104,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         return false;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
+        if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4, "prefill-split-handoff")) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
@@ -1171,7 +1175,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
-            (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4))) {
+            (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4, "prefill-ple"))) {
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
         }
@@ -1866,6 +1870,78 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
+        // Select before the issuer sees the sequence: selected experts never consume a ring slot or PCIe copy.
+        // Stable host blobs only; all buffers are reserved before omitting anything, so refusal keeps the GPU path.
+        std::vector<const uint8_t*> stream_cpu_blobs;
+        const double stream_share = stream_cpu_share_setting();
+        // The generic blob contract lasts only until the next call. These sources' non-transient pointers
+        // are arena/mapping/complement storage; decode's ownership rotations are drained during this read.
+        const bool stable_cpu_source = dynamic_cast<core::FileExpertSource*>(m.src) != nullptr ||
+                                       dynamic_cast<core::ArenaExpertSource*>(m.src) != nullptr;
+        if (stream_all && stream_cpu_pool_ != nullptr && stream_share > 0.0 && !m.cpu_dead && lay0.native &&
+            stable_cpu_source && lay0.fmt.size() == (size_t) g.n_layers) {
+            const size_t x_count = (size_t) T * N, row_count = (size_t) T * K * N;
+            const size_t job_count = (size_t) T * K / strata::kernels::cpu::MAXT + (size_t) g.n_expert;
+            share_rules::ShareMemory mem;
+            if (const auto available = core::available_host_bytes()) mem.avail_ram = *available;
+            mem.buffer_bytes = (x_count > m.cpu_x_n ? x_count - m.cpu_x_n : 0) * sizeof(float) +
+                               (row_count > m.cpu_rows_n ? row_count - m.cpu_rows_n : 0) * sizeof(float) +
+                               (size_t) T * sizeof(strata::kernels::cpu::NativeAct) +
+                               job_count * sizeof(strata::kernels::cpu::ExpertJobMulti);
+            bool ready = true;
+            try {
+                stream_cpu_blobs.resize((size_t) g.n_layers * g.n_expert, nullptr);
+                std::vector<const uint8_t*> eligible((size_t) g.n_expert, nullptr);
+                for (int64_t l = LB; l < LE; ++l) {
+                    std::fill(eligible.begin(), eligible.end(), nullptr);
+                    for (int32_t e = 0; e < g.n_expert; ++e) {
+                        if ((m.host_res && m.cache && m.host_res[(size_t) l * g.n_expert + e] >= 0) ||
+                            m.src->transient(l, e)) continue;
+                        eligible[(size_t) e] = m.src->blob(l, e);
+                    }
+                    stream_cpu_partition(eligible, stream_share);
+                    for (int32_t e = 0; e < g.n_expert; ++e)
+                        if (eligible[(size_t) e] && !m.src->pinned(l, e))
+                            mem.buffer_bytes += (uint64_t) lay0.blob_bytes(l);   // conservatively budget unpinned pages too
+                    std::copy(eligible.begin(), eligible.end(), stream_cpu_blobs.begin() + l * g.n_expert);
+                }
+                ready = share_rules::default_share_memory_verdict(mem).arm;
+            } catch (const std::bad_alloc&) {
+                ready = false;
+            }
+            if (ready && m.cpu_x_n < x_count) {
+                if (m.cpu_x) strata::gpu::free(m.cpu_x);
+                m.cpu_x = nullptr;
+                m.cpu_x_n = 0;
+                ready = strata::gpu::alloc_host(&m.cpu_x, x_count * sizeof(float), "prefill-stream-cpu");
+                if (ready) m.cpu_x_n = x_count;
+            }
+            if (ready && m.cpu_rows_n < row_count) {
+                if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
+                m.cpu_rows = nullptr;
+                m.cpu_rows_n = 0;
+                ready = strata::gpu::alloc_host(&m.cpu_rows, row_count * sizeof(float), "prefill-stream-cpu");
+                if (ready) m.cpu_rows_n = row_count;
+            }
+            if (ready) {
+                try {
+                    m.cpu_nact.resize((size_t) T);
+                    m.cpu_jobs.reserve(job_count);
+                } catch (const std::bad_alloc&) {
+                    ready = false;
+                    stream_cpu_blobs.clear();
+                }
+            }
+            if (!ready) {
+                stream_cpu_blobs.clear();
+                m.cpu_dead = true;
+                std::fprintf(stderr, "prefill: streamed CPU share declined before issuing: host buffers unavailable; "
+                                     "the GPU streams every expert\n");
+            }
+        }
+        auto streamed_cpu_blob = [&](int64_t l, int32_t e) -> const uint8_t* {
+            return stream_cpu_blobs.empty() ? nullptr : stream_cpu_blobs[(size_t) l * g.n_expert + e];
+        };
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -1876,7 +1952,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if ((m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                        streamed_cpu_blob(l, e) != nullptr) continue;
                     const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
                     const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
                     if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
@@ -2052,6 +2129,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 // recomputes them from R)
                 if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 normed = false;
+                static const bool combine_hc = [] {
+                    const char* e = std::getenv("STRATA_PREFILL_COMBINE_HC");
+                    return e != nullptr && std::strtol(e, nullptr, 10) != 0;
+                }();
+                // The MoE output stays in registers until the next half's norm. With HC in the shared region,
+                // xn16 aliases the routing weights still read by other work-groups: keep the separate launches.
+                // Debug reads bo; control vectors and PLE likewise keep their ordinary write boundary.
+                const bool combine_norm = combine_hc_norm_eligible(
+                    combine_hc, hc_in_region(), half, l, LE, ple_on, strata::kernels::cvec().covers(l),
+                    std::getenv("STRATA_DBG_NAN") != nullptr);
                 // STRATA_HC_Q8 with the BF16 copies dropped: each from its Q8_0 copy, dequantized on m.cs
                 core::WeightRef wdv = *wd, wuv = *wu;
                 if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, m.cs);
@@ -2313,8 +2400,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.ids_host.resize((size_t) T * K);
                     m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
-                    bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
-                                     lay_c.native && !lay_c.fmt.empty();
+                    const bool stream_cpu = stream_all && !stream_cpu_blobs.empty() &&
+                        std::any_of(stream_cpu_blobs.begin() + l * g.n_expert,
+                                    stream_cpu_blobs.begin() + (l + 1) * g.n_expert,
+                                    [](const uint8_t* b) { return b != nullptr; });
+                    kernels::cpu::ExpertPool* const active_pool = stream_all ? stream_cpu_pool_ : cpu_pool_;
+                    bool cpu_maybe = active_pool != nullptr && (stream_all ? stream_cpu : cpu_share_on()) &&
+                                     m.src != nullptr && !m.cpu_dead && lay_c.native && !lay_c.fmt.empty();
                     // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                     // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
                     // had ends the share for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0
@@ -2338,7 +2430,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
                     // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
                     static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
-                    if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
+                    if (cpu_maybe && !stream_cpu && cpu_share_env() < 0.0 && cpu_gate_on) {
                         constexpr int64_t CPU_PROBE = 29;
                         constexpr int CPU_MIN_RATIOS = 3;
                         const int64_t i = m.cpu_layers++;
@@ -2361,18 +2453,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (m.cpu_x) strata::gpu::free(m.cpu_x);
                             m.cpu_x = nullptr;
                             m.cpu_x_n = 0;
-                            if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float))) {
+                            if (!strata::gpu::alloc_host(&m.cpu_x, want * sizeof(float), "prefill-cpu-share")) {
                                 m.cpu_x = nullptr;
                                 cpu_share_off("the activation buffer");
                             } else {
                                 m.cpu_x_n = want;
                             }
                         }
-                        if (cpu_maybe) strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs);
+                        if (cpu_maybe && !strata::gpu::copy_async(m.cpu_x, m.mixed, want * sizeof(float), m.cs)) {
+                            err = std::string("prefill: CPU share activations: ") + strata::gpu::last_error();
+                            return false;
+                        }
                     }
-                    strata::gpu::stream_sync(m.cs);
+                    if (!strata::gpu::stream_sync(m.cs)) {
+                        err = std::string("prefill: routing and CPU share activation sync: ") + strata::gpu::last_error();
+                        return false;
+                    }
                     pt.fold();
-                    if (m.cpu_pend) {   // auto: the last CPU-sharing layer's GPU time is final now
+                    if (!stream_cpu && m.cpu_pend) {   // auto: the last CPU-sharing layer's GPU time is final now
                         m.cpu_pend = false;
                         float g_ms = 0;
                         if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1])) {
@@ -2383,14 +2481,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
                         }
                     }
-                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most kShareMaxT tokens' rows)
+                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::kShareMaxT * m.g->n_expert) * N;
                         if (m.cpu_rows_n < cap) {
                             cpu_cold = true;
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
                             m.cpu_rows = nullptr;
                             m.cpu_rows_n = 0;
-                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float))) {
+                            if (!strata::gpu::alloc_host(&m.cpu_rows, cap * sizeof(float), "prefill-cpu-share")) {
                                 m.cpu_rows = nullptr;
                                 cpu_share_off("the rows buffer");
                             } else {
@@ -2468,16 +2566,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ++n_stream;
                             // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                             // short-lived buffer (the arena's unpinned part, the mapped files' pages; upstream 92bce20e)
-                            if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                            if (stream_cpu ? streamed_cpu_blob(l, e) != nullptr
+                                           : c <= strata::kernels::cpu::kShareMaxT &&
+                                             (m.src->pinned(l, e) || !m.src->transient(l, e)))
                                 cand.emplace_back(c, e);
                         }
                         std::sort(cand.begin(), cand.end());
                         const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
-                        const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
+                        const size_t take = stream_cpu ? cand.size()
+                                                      : std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
                         // an expert without a blob stays on the GPU
                         for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
                             const int32_t e = cand[i].second;
-                            const uint8_t* b = m.src->blob(l, e);
+                            const uint8_t* b = stream_cpu ? streamed_cpu_blob(l, e) : m.src->blob(l, e);
                             if (b == nullptr) continue;
                             if (on_cpu.empty()) {
                                 on_cpu.assign((size_t) m.g->n_expert, 0);
@@ -2651,14 +2752,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.cpu_jobs.clear();
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             if (!on_cpu[(size_t) e]) continue;
-                            strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = cpu_blob[(size_t) e];
-                            j.nt = m.cnt[(size_t) e];
-                            for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
-                                j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
-                            m.cpu_jobs.push_back(j);
+                            stream_cpu_jobs(m.cpu_jobs, cpu_blob[(size_t) e], (size_t) m.cnt[(size_t) e],
+                                            m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] - rows_gpu) * N,
+                                            (size_t) N);
                         }
-                        if (cpu_share_env() < 0.0) {
+                        if (!stream_cpu && cpu_share_env() < 0.0) {
                             if (m.cpu_ev[0] == nullptr &&
                                 (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
                                 err = "prefill: CPU share events";
@@ -2666,7 +2764,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             strata::gpu::event_record(m.cpu_ev[0], m.cs);
                         }
-                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = cpu_pool_]() -> bool {
+                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = active_pool]() -> bool {
                             const auto t0 = std::chrono::steady_clock::now();
                             if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
                             std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
@@ -3075,17 +3173,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     }
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
-                        if (cpu_share_env() < 0.0) strata::gpu::event_record(m.cpu_ev[1], m.cs);   // after the GPU's experts
+                        if (!stream_cpu && cpu_share_env() < 0.0) strata::gpu::event_record(m.cpu_ev[1], m.cs);   // after the GPU's experts
                         if (!cpu_fut.get()) { err = "prefill: the CPU experts failed"; return false; }
-                        if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
+                        if (!stream_cpu && cpu_share_env() < 0.0 && n_stream > n_cpu) {
                             m.cpu_pend = true;
                             m.pend_cpu_ms = cpu_ms;
                             m.pend_n_cpu = n_cpu;
                             m.pend_n_gpu = n_stream - n_cpu;
                         }
-                        stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
-                        strata::gpu::copy_async(m.Dm + (size_t) rows_gpu * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
-                                                m.cs);
+                        stats_.cpu_share = stream_cpu ? stream_share : cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                        if (!strata::gpu::copy_async(m.Dm + (size_t) rows_gpu * N, m.cpu_rows,
+                                                     (size_t) rows_cpu * N * sizeof(float), m.cs)) {
+                            err = std::string("prefill: CPU share results: ") + strata::gpu::last_error();
+                            return false;
+                        }
                         stats_.experts_cpu += n_cpu;
                         if (static bool said = false; !said) {
                             said = true;
@@ -3102,7 +3203,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.pend_l = (int) l;
                         m.pend_wall_n = n_stream;
                     }
-                    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (!combine_norm) moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         strata::gpu::stream_sync(m.cs);
@@ -3143,6 +3244,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const core::LayerView vn(*m.wt, nl);
                     wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
                     if (!wnn) return false;
+                }
+                if (combine_norm) {
+                    moe_combine_gr_write_norm_rs(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.R, m.inj, HC,
+                                                 (const float*) wnn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
+                    normed = true;
+                    if (static bool said = false; !said) {
+                        said = true;
+                        std::fprintf(stderr, "strata prefill: STRATA_PREFILL_COMBINE_HC=1: MoE combine, HC write and next norm in one launch\n");
+                    }
+                    continue;
                 }
                 if (wnn && steered) {
                     gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, l, (const float*) wnn->data, EPS, m.xn, m.xn16, T, m.cs,
