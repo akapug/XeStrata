@@ -11,6 +11,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "param_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_stream
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -124,7 +125,86 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
 }
 
 namespace {
-// The resolve kernel: one work-group of RT work-items (1024 where the device takes it).
+// The resolve: one work-group of RT work-items (1024 where the device takes it) over one map; `mm` is the group's.
+template <int RT>
+void resolve_group(const sycl::nd_item<1>& it, const KvStreamMap& mm, const int32_t* ids, const int32_t* steps, int nq,
+                   int capi, int page_size, const sycl::local_accessor<int, 1>& sh,
+                   const sycl::local_accessor<int, 1>& warp_sums) {
+    const auto grp = it.get_group();
+    const int tid = (int) it.get_local_id(0);
+    local_atomic<int> s_nmiss(sh[0]), s_lookups(sh[1]);
+    const int epoch = mm.ctl[0] + 1;
+    if (tid == 0) { sh[0] = 0; sh[1] = 0; }
+    sycl::group_barrier(grp);
+    int lookups = 0;
+    for (int q = 0; q < nq; ++q) {
+        const int width = steps[q * kStepCount + kStepWidth];
+        const int32_t* qi = ids + (long long) q * capi;
+        for (int i = tid; i < width; i += RT) {
+            const int b = qi[i] / page_size;
+            if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
+            ++lookups;
+            const int sl = mm.page_table[b];
+            if (sl >= 0) {
+                mm.slot_stamp[sl] = epoch;
+                mm.slot_ref[sl] = 1;
+            } else if (sl == -1) {
+                int expected = -1;
+                if (global_atomic<int32_t>(mm.page_table[b]).compare_exchange_strong(expected, -2))
+                    mm.miss_block[s_nmiss.fetch_add(1)] = b;
+            }
+        }
+    }
+    s_lookups.fetch_add(lookups);
+    sycl::group_barrier(grp);
+    const int need = sh[0], n = (int) mm.n_slots;
+    int hand = mm.ctl[1], got = 0;
+    for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
+        const int j = (int) (((long long) hand + tid) % n);
+        const bool mine = mm.slot_stamp[j] == epoch;
+        const bool cand = !mine && (mm.slot_block[j] < 0 || mm.slot_ref[j] == 0);
+        int total = 0;
+        const int rank = block_scan<RT / WARP>(it, cand ? 1 : 0, warp_sums, total);
+        const int want = need - got;
+        if (tid == 0) sh[2] = RT;
+        sycl::group_barrier(grp);
+        if (cand && rank == want - 1) sh[2] = tid + 1;   // the hand stops just past the last slot taken
+        sycl::group_barrier(grp);
+        const int cut = sh[2];
+        if (cand && rank < want) {
+            mm.miss_slot[got + rank] = j;
+            mm.slot_stamp[j] = epoch;   // taken: a sweep that wraps around must not take it twice
+        } else if (tid < cut && !mine) {
+            mm.slot_ref[j] = 0;
+        }
+        got += total < want ? total : want;
+        hand = (int) (((long long) hand + cut) % n);
+        sycl::group_barrier(grp);
+    }
+    const int placed = got < need ? got : need;
+    for (int k = tid; k < need; k += RT) {
+        const int b = mm.miss_block[k];
+        if (k >= placed) { mm.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
+        const int sl = mm.miss_slot[k];
+        const int old = mm.slot_block[sl];
+        if (old >= 0) mm.page_table[old] = -1;
+        mm.slot_block[sl] = b;
+        mm.slot_stamp[sl] = epoch;
+        mm.slot_ref[sl] = 1;
+        mm.page_table[b] = sl;
+    }
+    if (tid == 0) {
+        mm.ctl[0] = epoch;
+        mm.ctl[1] = hand;
+        mm.ctl[2] = placed;
+        if (placed < need) mm.ctl[3] = 1;
+        auto* c = reinterpret_cast<unsigned long long*>(mm.ctl + 4);
+        c[0] += (unsigned long long) placed;
+        c[1] += (unsigned long long) sh[1];
+        c[2] += 1ull;
+    }
+}
+
 template <int RT>
 void resolve_launch(sycl::queue& queue, const KvStreamMap mm, const int32_t* ids, const int32_t* steps, int nq,
                     int capi, int page_size) {
@@ -132,80 +212,29 @@ void resolve_launch(sycl::queue& queue, const KvStreamMap mm, const int32_t* ids
         sycl::local_accessor<int, 1> sh(sycl::range<1>(3), hd);          // s_nmiss, s_lookups, s_cut
         sycl::local_accessor<int, 1> warp_sums(sycl::range<1>(32), hd);
         hd.parallel_for(sycl::nd_range<1>(RT, RT), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const auto grp = it.get_group();
-            const int tid = (int) it.get_local_id(0);
-            local_atomic<int> s_nmiss(sh[0]), s_lookups(sh[1]);
-            const int epoch = mm.ctl[0] + 1;
-            if (tid == 0) { sh[0] = 0; sh[1] = 0; }
-            sycl::group_barrier(grp);
-            int lookups = 0;
-            for (int q = 0; q < nq; ++q) {
-                const int width = steps[q * kStepCount + kStepWidth];
-                const int32_t* qi = ids + (long long) q * capi;
-                for (int i = tid; i < width; i += RT) {
-                    const int b = qi[i] / page_size;
-                    if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
-                    ++lookups;
-                    const int sl = mm.page_table[b];
-                    if (sl >= 0) {
-                        mm.slot_stamp[sl] = epoch;
-                        mm.slot_ref[sl] = 1;
-                    } else if (sl == -1) {
-                        int expected = -1;
-                        if (global_atomic<int32_t>(mm.page_table[b]).compare_exchange_strong(expected, -2))
-                            mm.miss_block[s_nmiss.fetch_add(1)] = b;
-                    }
-                }
-            }
-            s_lookups.fetch_add(lookups);
-            sycl::group_barrier(grp);
-            const int need = sh[0], n = (int) mm.n_slots;
-            int hand = mm.ctl[1], got = 0;
-            for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
-                const int j = (int) (((long long) hand + tid) % n);
-                const bool mine = mm.slot_stamp[j] == epoch;
-                const bool cand = !mine && (mm.slot_block[j] < 0 || mm.slot_ref[j] == 0);
-                int total = 0;
-                const int rank = block_scan<RT / WARP>(it, cand ? 1 : 0, warp_sums, total);
-                const int want = need - got;
-                if (tid == 0) sh[2] = RT;
-                sycl::group_barrier(grp);
-                if (cand && rank == want - 1) sh[2] = tid + 1;   // the hand stops just past the last slot taken
-                sycl::group_barrier(grp);
-                const int cut = sh[2];
-                if (cand && rank < want) {
-                    mm.miss_slot[got + rank] = j;
-                    mm.slot_stamp[j] = epoch;   // taken: a sweep that wraps around must not take it twice
-                } else if (tid < cut && !mine) {
-                    mm.slot_ref[j] = 0;
-                }
-                got += total < want ? total : want;
-                hand = (int) (((long long) hand + cut) % n);
-                sycl::group_barrier(grp);
-            }
-            const int placed = got < need ? got : need;
-            for (int k = tid; k < need; k += RT) {
-                const int b = mm.miss_block[k];
-                if (k >= placed) { mm.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
-                const int sl = mm.miss_slot[k];
-                const int old = mm.slot_block[sl];
-                if (old >= 0) mm.page_table[old] = -1;
-                mm.slot_block[sl] = b;
-                mm.slot_stamp[sl] = epoch;
-                mm.slot_ref[sl] = 1;
-                mm.page_table[b] = sl;
-            }
-            if (tid == 0) {
-                mm.ctl[0] = epoch;
-                mm.ctl[1] = hand;
-                mm.ctl[2] = placed;
-                if (placed < need) mm.ctl[3] = 1;
-                auto* c = reinterpret_cast<unsigned long long*>(mm.ctl + 4);
-                c[0] += (unsigned long long) placed;
-                c[1] += (unsigned long long) sh[1];
-                c[2] += 1ull;
-            }
+            resolve_group<RT>(it, mm, ids, steps, nq, capi, page_size, sh, warp_sums);
         });
+    });
+}
+
+// The rows' maps, by value into the kernel (a captured graph bakes them, as it bakes the per-row launches' maps).
+// The rows' maps.  Like RowRuns below, the kernel takes it BY POINTER (param_table.hpp): at 32 rows it is 2304 bytes,
+// past the B70's 2048 bytes of kernel arguments.
+struct Maps {
+    KvStreamMap m[kQsaSlotsMax];
+};
+
+template <int RT>
+void resolve_slots_launch(sycl::queue& queue, const Maps* maps, const int32_t* ids, const int32_t* steps, int rows,
+                          int capi, int page_size) {
+    queue.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<int, 1> sh(sycl::range<1>(3), hd);
+        sycl::local_accessor<int, 1> warp_sums(sycl::range<1>(32), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) rows * RT, RT), xe::fits("kv_stream_resolve_slots", [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int r = (int) it.get_group(0);
+            resolve_group<RT>(it, maps->m[r], ids + (long long) r * capi, steps + (long long) r * kStepCount, 1, capi,
+                              page_size, sh, warp_sums);
+        }));
     });
 }
 }  // namespace
@@ -242,6 +271,65 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         }
     });
     finish(stream, e, "kv_stream_resolve");
+}
+
+// The rows' copy tables: row r's misses (its map's ctl, miss_block, miss_slot) and its runs.  By pointer, as Maps
+// (2840 bytes at 32 rows); `pad` keeps it free of padding, so its bytes are its key.
+struct RowRuns {
+    const int32_t* ctl[kQsaSlotsMax];
+    const int32_t* miss_block[kQsaSlotsMax];
+    const int32_t* miss_slot[kQsaSlotsMax];
+    const uint8_t* src[kQsaSlotsMax][4];
+    uint8_t* dst[kQsaSlotsMax][4];
+    int len[4];
+    int n;
+    int pad;
+};
+
+void kv_stream_resolve_slots(const KvResolveSlots& tab, int fmt, const int32_t* ids, const int32_t* steps, int n_rows,
+                             int64_t cap, const QsaShapes& s, void* stream) {
+    if (n_rows <= 0) return;
+    if (n_rows > kQsaSlotsMax) throw core::DeviceError("kv_stream_resolve_slots: more rows than a window holds");
+    if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0)
+        throw core::DeviceError("kv_stream: a block's scale run must be a multiple of 16 bytes");
+    auto& queue = queue_for(stream);
+    const int rt = xe::work_group_upto_1024(queue);
+    Maps maps{};
+    RowRuns rr{};
+    for (int r = 0; r < n_rows; ++r) {
+        const KvStreamMap& m = tab.map[r];
+        if (m.n_slots < rt)
+            throw core::DeviceError("kv_stream: " + std::to_string(m.n_slots) + " slots is fewer than the resolve block (" +
+                                    std::to_string(rt) + "): the clock sweep would take a slot twice");
+        maps.m[r] = m;
+        const Runs x = runs_of(tab.slots[r], tab.host[r], fmt, s);
+        rr.ctl[r] = m.ctl;
+        rr.miss_block[r] = m.miss_block;
+        rr.miss_slot[r] = m.miss_slot;
+        for (int a = 0; a < x.n; ++a) { rr.src[r][a] = x.src[a]; rr.dst[r][a] = x.dst[a]; rr.len[a] = x.len[a]; }
+        rr.n = x.n;
+    }
+    const int capi = (int) cap, page_size = (int) s.page_size;
+    const Maps* dm = xe::device_table(queue, maps);
+    if (rt == 1024) resolve_slots_launch<1024>(queue, dm, ids, steps, n_rows, capi, page_size);
+    else if (rt == 512) resolve_slots_launch<512>(queue, dm, ids, steps, n_rows, capi, page_size);
+    else resolve_slots_launch<256>(queue, dm, ids, steps, n_rows, capi, page_size);
+    // kv_stream_resolve's copy, kCopyGroups work-groups a row over that row's misses
+    constexpr int kCopyGroups = 8;
+    const RowRuns* rc = xe::device_table(queue, rr);
+    const auto e = queue.parallel_for(sycl::nd_range<1>((size_t) n_rows * kCopyGroups * 128, 128), xe::fits("kv_stream_resolve_slots copy", [=](sycl::nd_item<1> it) {
+        const int r = (int) it.get_group(0) / kCopyGroups, g = (int) it.get_group(0) % kCopyGroups;
+        const int need = rc->ctl[r][2];
+        for (int k = g; k < need; k += kCopyGroups) {
+            const long long b = rc->miss_block[r][k], sl = rc->miss_slot[r][k];
+            for (int a = 0; a < rc->n; ++a) {
+                const auto* src = reinterpret_cast<const sycl::uint4*>(rc->src[r][a] + b * rc->len[a]);
+                auto* dst = reinterpret_cast<sycl::uint4*>(rc->dst[r][a] + sl * rc->len[a]);
+                for (int i = (int) it.get_local_id(0); i < rc->len[a] / 16; i += 128) dst[i] = src[i];
+            }
+        }
+    }));
+    finish(stream, e, "kv_stream_resolve_slots");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {

@@ -33,19 +33,24 @@
 // The CUDA file keeps separate ncols = 1 kernels and a multi-column kernel built to be bitwise equal to them; here
 // the multi-column kernel with NCOLS = 1 and the ncols = 1 layout (4 warps, 1 row, or 4 rows for small K) is the
 // single-column path, so both share one set of dot-product traits.  A warp is a sub-group of 32.
+#include <algorithm>
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#include "mmvq_slm.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace strata::kernels {
 namespace {
@@ -57,7 +62,8 @@ constexpr int VDR = 2;
 constexpr int WARPS = 4;
 constexpr int WARP = 32;
 constexpr int QUANT_THREADS = 256;
-constexpr int MAX_NCOLS = 8;
+constexpr int MAX_NCOLS = kVerifyMaxT;
+constexpr int MMVQ_TILE_COLS = kVerifyDefaultT;
 
 using half = sycl::half;
 using half2 = sycl::half2;
@@ -286,17 +292,20 @@ struct Q5KTraits {
         r.dm = bq5->dm;
         return r;
     }
-    static float apply(const W& r, const Q81Block* bq8, int iqs) {
-        int u[4];
-        float d8[2];
+    // the activations' half of a product (loadx), which the lane's iqs alone places: read once, it serves every row
+    struct X { int u[4]; float d8[2]; };
+    static X loadx(const Q81Block* bq8, int iqs) {
+        X x;
         for (int i = 0; i < 2; ++i) {
-            const Q81Block* bq8i = bq8 + r.bq8_offset + i;
-            d8[i] = low(bq8i->ds);
-            u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
-            u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
+            const Q81Block* bq8i = bq8 + 2 * ((iqs / 2) / 4) + i;
+            x.d8[i] = low(bq8i->ds);
+            x.u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
+            x.u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
         }
-        return q5_q8_dot_impl(r.vl, r.vh, u, r.sc, r.sc + 2, r.dm, d8);
+        return x;
     }
+    static float applyx(const W& r, const X& x, int) { return q5_q8_dot_impl(r.vl, r.vh, x.u, r.sc, r.sc + 2, r.dm, x.d8); }
+    static float apply(const W& r, const Q81Block* bq8, int iqs) { return applyx(r, loadx(bq8, iqs), iqs); }
 };
 struct Q4KTraits {
     using Block = Q4KBlock;
@@ -315,17 +324,20 @@ struct Q4KTraits {
         r.dm = bq4->dm;
         return r;
     }
-    static float apply(const W& r, const Q81Block* bq8, int iqs) {
-        int u[4];
-        float d8[2];
+    // the activations' half of a product (loadx), which the lane's iqs alone places: read once, it serves every row
+    struct X { int u[4]; float d8[2]; };
+    static X loadx(const Q81Block* bq8, int iqs) {
+        X x;
         for (int i = 0; i < 2; ++i) {
-            const Q81Block* bq8i = bq8 + r.bq8_offset + i;
-            d8[i] = low(bq8i->ds);
-            u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
-            u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
+            const Q81Block* bq8i = bq8 + 2 * ((iqs / 2) / 4) + i;
+            x.d8[i] = low(bq8i->ds);
+            x.u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
+            x.u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
         }
-        return q4_q8_dot_impl(r.v, u, r.sc, r.sc + 2, r.dm, d8);
+        return x;
     }
+    static float applyx(const W& r, const X& x, int) { return q4_q8_dot_impl(r.v, x.u, r.sc, r.sc + 2, r.dm, x.d8); }
+    static float apply(const W& r, const Q81Block* bq8, int iqs) { return applyx(r, loadx(bq8, iqs), iqs); }
 };
 // Exact pinned vec_dot_q2_0_q8_1: each thread handles one 32-element chunk.  The weight block is only 2-byte
 // aligned, so qs is loaded as int16_t, unlike the naturally 4-byte aligned activation codes.
@@ -430,15 +442,18 @@ struct Q6KTraits {
         r.d = (float) w->d;
         return r;
     }
-    static float apply(const W& r, const Q81Block* x, int iqs) {
-        int u[2];
-        float d8[2];
+    struct X { int u[2]; float d8[2]; };
+    static X loadx(const Q81Block* x, int iqs) {
+        X v;
+        const int off = 4 * (iqs / 16) + (iqs % 16) / 8;   // load's bq8_offset
         for (int i = 0; i < 2; ++i) {
-            u[i] = load_int(x[r.bq8_offset + 2 * i].qs, iqs % 8);
-            d8[i] = low(x[r.bq8_offset + 2 * i].ds);
+            v.u[i] = load_int(x[off + 2 * i].qs, iqs % 8);
+            v.d8[i] = low(x[off + 2 * i].ds);
         }
-        return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
+        return v;
     }
+    static float applyx(const W& r, const X& x, int) { return q6_q8_dot_impl(r.vl, r.vh, x.u, r.scales, r.d, x.d8); }
+    static float apply(const W& r, const Q81Block* x, int iqs) { return applyx(r, loadx(x, iqs), iqs); }
 };
 // kNativeQ6KRows: Q6KTraits' loads from the row's split arrays, every 32-bit load aligned; the same values reach
 // the same dot, so the results are Q6KTraits' bit for bit.
@@ -472,15 +487,23 @@ struct IQ4XSTraits {
         r.dw = (float) w->d;
         return r;
     }
-    static float apply(const W& r, const Q81Block* x, int iqs) {
+    struct X { int u[8]; float d; };
+    static X loadx(const Q81Block* x, int iqs) {
+        X v;
+        for (int j = 0; j < 8; ++j) v.u[j] = load_int(x[iqs / 4].qs, j);
+        v.d = low(x[iqs / 4].ds);
+        return v;
+    }
+    static float applyx(const W& r, const X& x, int) {
         int sumi = 0;
         for (int j = 0; j < 4; ++j) {
-            sumi = dp4a(r.v[j].x, load_int(x[iqs / 4].qs, j), sumi);
-            sumi = dp4a(r.v[j].y, load_int(x[iqs / 4].qs, j + 4), sumi);
+            sumi = dp4a(r.v[j].x, x.u[j], sumi);
+            sumi = dp4a(r.v[j].y, x.u[j + 4], sumi);
         }
         sumi *= r.ls - 32;
-        return r.dw * low(x[iqs / 4].ds) * sumi;
+        return r.dw * x.d * sumi;
     }
+    static float apply(const W& r, const Q81Block* x, int iqs) { return applyx(r, loadx(x, iqs), iqs); }
 };
 // QI=4 for Q4_0/Q5_0/IQ4_NL and QI=8 for Q8_0. With VDR=2 this preserves the pinned 64/32-block iteration and
 // 2048/1024-element small-K thresholds.
@@ -530,19 +553,32 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
             for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
                 const int kby = kbx * F::KBY;
                 const int kqs = F::kqs(tid);
+                // Every row's block first, then each column's activations read once for all the rows (STRATA_MMVQ_ROWS:
+                // the column loop outside the row loop).  A row's sum takes the same terms in the same order either way.
+                typename F::W wv[ROWS];
                 #pragma unroll
                 for (int i = 0; i < ROWS; ++i) {
                     // The source assumes allocator padding for partial row groups. This
                     // guard preserves every valid row's math without an out-of-bounds read.
                     if (row0 + i < n_out) {
-                        typename F::W wv;
                         if constexpr (requires { F::load_row; })
-                            wv = F::load_row(static_cast<const uint8_t*>(weights), row0 + i, kbx, blocks_per_row, kqs);
+                            wv[i] = F::load_row(static_cast<const uint8_t*>(weights), row0 + i, kbx, blocks_per_row, kqs);
                         else
-                            wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                            wv[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const Q81Block* xj = x + std::size_t(j) * x_stride + kby;
+                    if constexpr (requires { F::loadx; }) {   // the column's activations in registers, once
+                        const auto xv = F::loadx(xj, kqs);
                         #pragma unroll
-                        for (int j = 0; j < NCOLS; ++j)
-                            tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                        for (int i = 0; i < ROWS; ++i)
+                            if (row0 + i < n_out) tmp[j][i] += F::applyx(wv[i], xv, kqs);
+                    } else {
+                        #pragma unroll
+                        for (int i = 0; i < ROWS; ++i)
+                            if (row0 + i < n_out) tmp[j][i] += F::apply(wv[i], xj, kqs);
                     }
                 }
             }
@@ -577,45 +613,153 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
 // A column's arithmetic does not depend on NCOLS, so every column is bitwise its single-column call.
 // With `weights2` (a second matrix of the same type and shape, upstream b08cf3e1's pair), rows n_out .. 2 n_out - 1
 // are its rows, written to y2: two products of the same activations in one launch, each row's arithmetic unchanged.
-template<typename F, int NCOLS, int RPG>
+template<typename F, int NCOLS, int RPG, int R = 1>
 sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
                        const void* weights2 = nullptr, float* y2 = nullptr) {
     static_assert(WARP % F::T == 0, "a block's lanes must divide the sub-group");
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const int rows_all = weights2 ? 2 * n_out : n_out;
-    const std::size_t groups = (std::size_t(rows_all) + RPG - 1) / RPG;
+    const std::size_t groups = (std::size_t(rows_all) + RPG * R - 1) / (RPG * R);
     return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
-        int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
-        if (row >= rows_all) return;                        // whole sub-groups only, and no barrier follows
-        const void* wsrc = weights;
-        float* ydst = y;
-        if (row >= n_out) {   // the second matrix
-            row -= n_out;
-            wsrc = weights2;
-            ydst = y2;
+        const int row0 = ((int) it.get_group(0) * RPG + (int) sg.get_group_linear_id()) * R;
+        if (row0 >= rows_all) return;                       // whole sub-groups only, and no barrier follows
+        // R rows a sub-group (STRATA_MMVQ_ROWS): each row's own matrix, row and output, the second matrix's past n_out
+        const uint8_t* wsrc[R];
+        float* ydst[R];
+        int rr[R];
+        #pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const int row = row0 + i < rows_all ? row0 + i : row0;   // a tail row repeats the first, never written
+            const bool second = row >= n_out;
+            wsrc[i] = static_cast<const uint8_t*>(second ? weights2 : weights);
+            ydst[i] = second ? y2 : y;
+            rr[i] = second ? row - n_out : row;
         }
-        const auto* w = static_cast<const typename F::Block*>(wsrc);
         const int blocks_per_row = n_in / F::DIV;
         const int x_stride = n_in / Q8K;
         const int kqs = F::kqs(lane);
-        float tmp[NCOLS] = {};
+        float tmp[NCOLS][R] = {};
         for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
-            typename F::W wv;
-            if constexpr (requires { F::load_row; })
-                wv = F::load_row(static_cast<const uint8_t*>(wsrc), row, kbx, blocks_per_row, kqs);
-            else
-                wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
-            for (int j = 0; j < NCOLS; ++j)
-                tmp[j] += F::apply(wv, x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY, kqs);
+            typename F::W wv[R];
+            #pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if constexpr (requires { F::load_row; })
+                    wv[i] = F::load_row(wsrc[i], rr[i], kbx, blocks_per_row, kqs);
+                else
+                    wv[i] = F::load(reinterpret_cast<const typename F::Block*>(wsrc[i]) +
+                                        std::size_t(rr[i]) * blocks_per_row + kbx, kqs);
+            }
+            // each column's activations read once for the R rows; a row's sum is its R = 1 sum, term for term
+            #pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const Q81Block* xj = x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY;
+                if constexpr (requires { F::loadx; }) {   // the column's activations in registers, once
+                    const auto xv = F::loadx(xj, kqs);
+                    #pragma unroll
+                    for (int i = 0; i < R; ++i) tmp[j][i] += F::applyx(wv[i], xv, kqs);
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < R; ++i) tmp[j][i] += F::apply(wv[i], xj, kqs);
+                }
+            }
         }
-        for (int j = 0; j < NCOLS; ++j) {
-            const float s = warp_sum(sg, tmp[j]);
-            if (lane == 0) ydst[std::size_t(j) * n_out + row] = s;
+        #pragma unroll
+        for (int i = 0; i < R; ++i) {
+            if (row0 + i >= rows_all) break;
+            for (int j = 0; j < NCOLS; ++j) {
+                const float s = warp_sum(sg, tmp[j][i]);
+                if (lane == 0) ydst[i][std::size_t(j) * n_out + rr[i]] = s;
+            }
         }
     });
+}
+
+// STRATA_MMVQ_ROWS (the sub-group layout, rows up to 10 steps: the 2560-wide ones) and STRATA_MMVQ_WG_ROWS (the
+// work-group layout, the 6144-wide ones): output rows a sub-group or work-group takes from STRATA_MMVQ_ROWS_MIN_COLS
+// columns (default 2); 1 (the default) is the established layout, 2 or 4 read each activation block once for that
+// many rows.  Measured on the B70 at 16 columns with 16 a pass (mmvq_rows_parity): 2 in the sub-group layout 4-27%
+// faster (IQ4_XS, Q5_K's head), in the work-group layout 35% faster on IQ4_XS and 15-25% slower on the K-quants; 4
+// slower everywhere; 8 spilled and was dropped.
+// STRATA_MMVQ_TILE_COLS: the columns one pass takes, 8 (the default) or 16; past it the product runs in passes of that
+// many, each reading the whole matrix again (a 16-token window's products read their weights twice at 8).
+constexpr int kMmvqRowsDefault = 1;
+constexpr int kMmvqTileColsDefault = MMVQ_TILE_COLS;
+constexpr int kMmvqRowsMinColsDefault = 2;
+int env_int_or(const char* name, int def) {
+    const char* v = std::getenv(name);
+    return v == nullptr || *v == 0 ? def : (int) std::strtol(v, nullptr, 10);
+}
+int g_mmvq_rows = 0;   // 0: not yet read from STRATA_MMVQ_ROWS
+int mmvq_rows(int ncols) {
+    if (g_mmvq_rows == 0) {
+        const int r = env_int_or("STRATA_MMVQ_ROWS", kMmvqRowsDefault);
+        if (r != 1 && r != 2 && r != 4) throw std::invalid_argument("STRATA_MMVQ_ROWS must be 1, 2 or 4");
+        g_mmvq_rows = r;
+    }
+    static const int min_cols = env_int_or("STRATA_MMVQ_ROWS_MIN_COLS", kMmvqRowsMinColsDefault);
+    return ncols >= min_cols ? g_mmvq_rows : 1;
+}
+int g_mmvq_wg_rows = 0;   // 0: not yet read from STRATA_MMVQ_WG_ROWS
+int mmvq_wg_rows(int ncols) {
+    if (g_mmvq_wg_rows == 0) {
+        const int r = env_int_or("STRATA_MMVQ_WG_ROWS", kMmvqRowsDefault);
+        if (r != 1 && r != 2 && r != 4) throw std::invalid_argument("STRATA_MMVQ_WG_ROWS must be 1, 2 or 4");
+        g_mmvq_wg_rows = r;
+    }
+    static const int min_cols = env_int_or("STRATA_MMVQ_ROWS_MIN_COLS", kMmvqRowsMinColsDefault);
+    return ncols >= min_cols ? g_mmvq_wg_rows : 1;
+}
+// STRATA_MMVQ_SLM=1 (default 0, off): a product a rule names takes the window's columns in one pass with their
+// activations in local memory (mmvq_slm.hpp), every output the established kernels' bits.  The rules
+// (STRATA_MMVQ_SLM_ROLES, native_mmvq_slm_rules' text) are the B70 card's measured winners (mmvq_slm_parity at 50
+// reps, 2026-10-23 22:04Z, odie 0000:23:00.0): a role, type and column count where the best staged shape beat the
+// established 16-a-pass, 2-row layout by 10 % or more, with that shape's rows and sub-groups; an unmeasured count
+// between two measured ones takes the nearer one's verdict.  Measured and left out: every type's qkv from 4 columns,
+// the shared expert's down projection and IQ4_XS's ssm_out.  STRATA_MMVQ_SLM_ROWS (1, 2 or 4) and
+// STRATA_MMVQ_SLM_SGS (1 to 16) override every rule's (default 0: the rule's), STRATA_MMVQ_SLM_KB is the KiB of local
+// memory a work-group (default 36: two rounds of IQ4_XS's 16 columns, 18 KiB each), STRATA_MMVQ_SLM_GRF its registers
+// (256, the large register file, the default; or 128).
+constexpr const char* kMmvqSlmRolesDefault =
+    "ssm_out:8:1-4:2:16,ssm_out:8:5-16:1:16,ssm_out:12:13-16:1:16,ssm_out:13:13-16:1:16,ssm_out:14:13-16:1:16,"
+    "ssm_out:q6krows:13-16:2:16,ssm_out:20:3-16:1:16,ssm_out:21:13-16:4:8,ssm_out:42:1-1:4:8,"
+    "shexp_gu:8:1-1:2:4,shexp_gu:12:7-16:1:16,shexp_gu:13:3-4:1:8,shexp_gu:13:5-8:1:16,shexp_gu:13:9-16:1:8,"
+    "shexp_gu:14:13-16:1:16,shexp_gu:q6krows:13-16:1:16,shexp_gu:20:13-16:2:8,shexp_gu:23:13-16:2:8,"
+    "qkv:8:1-1:2:4,qkv:12:1-1:4:4,qkv:20:1-1:4:8,qkv:42:1-1:4:4";
+const MmvqSlm kMmvqSlmDefault{};
+bool g_slm_read = false;
+MmvqSlm g_slm = kMmvqSlmDefault;
+thread_local MmvqRole t_role = MmvqRole::other;
+void check_slm(const MmvqSlm& c) {
+    const auto rows_ok = [](int r) { return r == 1 || r == 2 || r == 4; };
+    if ((c.rows != 0 && !rows_ok(c.rows)) || c.sgs < 0 || c.sgs > 16 || c.kb < 1 || (c.grf != 128 && c.grf != 256))
+        throw std::invalid_argument("STRATA_MMVQ_SLM: rows 0, 1, 2 or 4, sub-groups 0-16, KiB >= 1, GRF 128 or 256");
+    for (const auto& r : c.rules)
+        if (!rows_ok(r.rows) || r.sgs < 1 || r.sgs > 16 || r.min_cols < 1 || r.max_cols < r.min_cols ||
+            r.max_cols > MAX_NCOLS)
+            throw std::invalid_argument("STRATA_MMVQ_SLM_ROLES: rows 1, 2 or 4, sub-groups 1-16, 1 <= min <= max <= " +
+                                        std::to_string(MAX_NCOLS) + " columns");
+}
+int g_mmvq_tile = 0;   // 0: not yet read from STRATA_MMVQ_TILE_COLS
+int mmvq_tile_cols() {
+    if (g_mmvq_tile == 0) {
+        const int c = env_int_or("STRATA_MMVQ_TILE_COLS", kMmvqTileColsDefault);
+        if (c != 8 && c != 16) throw std::invalid_argument("STRATA_MMVQ_TILE_COLS must be 8 or 16");
+        g_mmvq_tile = c;
+    }
+    return g_mmvq_tile;
+}
+
+// the work-group layout's rows (STRATA_MMVQ_WG_ROWS): R rows a work-group of four sub-groups, R = 1 as before
+template<typename F, int NCOLS, int R>
+void launch_wg(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+    if (R == 1 && n_in / F::DIV < F::BPI)
+        launch_kernel<F, NCOLS, WARPS, WARPS>(q, weights, x_q8_1, y, n_in, n_out,
+                                              (std::size_t(n_out) + WARPS - 1) / WARPS);
+    else
+        launch_kernel<F, NCOLS, WARPS, R>(q, weights, x_q8_1, y, n_in, n_out, (std::size_t(n_out) + R - 1) / R);
 }
 
 template<typename F, int NCOLS>
@@ -630,21 +774,25 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if (steps <= 10) {
-        launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
+        switch (NCOLS > 1 ? mmvq_rows(NCOLS) : 1) {
+            case 2: launch_row<F, NCOLS, 8, 2>(q, weights, x_q8_1, y, n_in, n_out); break;
+            case 4: launch_row<F, NCOLS, 8, 4>(q, weights, x_q8_1, y, n_in, n_out); break;
+            default: launch_row<F, NCOLS, 8, 1>(q, weights, x_q8_1, y, n_in, n_out);
+        }
         return;
     }
-    if (n_in / F::DIV < F::BPI)
-        launch_kernel<F, NCOLS, WARPS, WARPS>(q, weights, x_q8_1, y, n_in, n_out,
-                                              (std::size_t(n_out) + WARPS - 1) / WARPS);
-    else
-        launch_kernel<F, NCOLS, WARPS, 1>(q, weights, x_q8_1, y, n_in, n_out, std::size_t(n_out));
+    switch (NCOLS > 1 ? mmvq_wg_rows(NCOLS) : 1) {
+        case 2: launch_wg<F, NCOLS, 2>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 4: launch_wg<F, NCOLS, 4>(q, weights, x_q8_1, y, n_in, n_out); break;
+        default: launch_wg<F, NCOLS, 1>(q, weights, x_q8_1, y, n_in, n_out);
+    }
 }
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ column count exceeds compiled window capacity");
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -657,6 +805,70 @@ sycl::queue& validate_stream(void* stream) {
     return queue;
 }
 
+// STRATA_MMVQ_SLM's view of a format's traits (mmvq_slm.hpp): a lane's weight values for block kbx of a row, then its
+// term for each of R rows from the block's activations, as launch_kernel and launch_row take them (kqs from the lane:
+// every format's kqs reads the thread index modulo a divisor of 32, so the virtual lane's and the lane's agree).
+template <typename F>
+struct SlmOps {
+    static constexpr int T = F::T, KBY = F::KBY, DIV = F::DIV;
+    using W = typename F::W;
+    static W load(const uint8_t* w, std::size_t, int row, int kbx, int bpr, int lane) {
+        if constexpr (requires { F::load_row; })
+            return F::load_row(w, row, kbx, bpr, F::kqs(lane));
+        else
+            return F::load(reinterpret_cast<const typename F::Block*>(w) + std::size_t(row) * bpr + kbx, F::kqs(lane));
+    }
+    template <int R>
+    static void dot(const W (&wv)[R], const uint32_t* x, int lane, float (&acc)[R]) {
+        const auto* xb = reinterpret_cast<const Q81Block*>(x);
+        const int kqs = F::kqs(lane);
+        if constexpr (requires { F::loadx; }) {
+            const auto xv = F::loadx(xb, kqs);
+            #pragma unroll
+            for (int k = 0; k < R; ++k) acc[k] += F::applyx(wv[k], xv, kqs);
+        } else {
+            #pragma unroll
+            for (int k = 0; k < R; ++k) acc[k] += F::apply(wv[k], xb, kqs);
+        }
+    }
+};
+
+// the device's local memory a work-group may take (the process's cards are one model: read once)
+std::size_t local_bytes(sycl::queue& q) {
+    static const std::size_t n = q.get_device().get_info<sycl::info::device::local_mem_size>();
+    return n;
+}
+
+// the native type a format's traits serve, which the STRATA_MMVQ_SLM rules key on (specialized beside the traits)
+template <typename F>
+constexpr int kSlmType = -1;
+
+// The STRATA_MMVQ_SLM launch of native_mmvq (w2 null) or of native_mmvq_pair: the sub-group layout's partition (one
+// virtual sub-group) where launch_n takes launch_row, the work-group layout's (four) where it takes launch_kernel, so
+// every output is that kernel's bits.  False, launching nothing, where no rule picks the product, the upstream
+// multi-column layout is selected, or the shape does not fit (a pair needs launch_row's).
+template <typename F>
+bool slm_try(sycl::queue& q, const void* w, const void* w2, const void* x, float* y, float* y2, int n_in, int n_out,
+             int ncols) {
+    if (ncols > 1 && !g_multi_exact) return false;
+    const auto p = native_mmvq_slm_pick(kSlmType<F>, ncols);
+    if (!p) return false;
+    using O = SlmOps<F>;
+    const std::size_t lm = local_bytes(q);
+    const bool large = p->grf == 256;
+    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
+    if (steps <= 10) {
+        switch (p->rows) {
+            case 4: return slm::launch<O, 1, 4>(q, w, w2, x, y, y2, 0, n_in, n_out, ncols, p->sgs, p->kb, lm, large);
+            case 2: return slm::launch<O, 1, 2>(q, w, w2, x, y, y2, 0, n_in, n_out, ncols, p->sgs, p->kb, lm, large);
+            default: return slm::launch<O, 1, 1>(q, w, w2, x, y, y2, 0, n_in, n_out, ncols, p->sgs, p->kb, lm, large);
+        }
+    }
+    if (w2) return false;
+    if (p->rows == 1) return slm::launch<O, WARPS, 1>(q, w, w2, x, y, y2, 0, n_in, n_out, ncols, p->sgs, p->kb, lm, large);
+    return slm::launch<O, WARPS, 2>(q, w, w2, x, y, y2, 0, n_in, n_out, ncols, p->sgs, p->kb, lm, large);
+}
+
 template<typename F>
 void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, F::DIV);
@@ -665,6 +877,13 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
     validate_pointer(x_q8_1);
     validate_pointer(y);
     auto& q = validate_stream(stream);
+    if (slm_try<F>(q, weights, nullptr, x_q8_1, y, nullptr, n_in, n_out, ncols)) return;
+    if (const int tile = mmvq_tile_cols(); ncols > tile) {
+        for (int c = 0; c < ncols; c += tile)
+            mmvq<F>(weights, static_cast<const uint8_t*>(x_q8_1) + (size_t) c * (n_in / Q8K) * sizeof(Q81Block),
+                    y + (size_t) c * n_out, n_in, n_out, std::min(ncols - c, tile), stream);
+        return;
+    }
     switch (ncols) {
         case 1: launch_n<F, 1>(q, weights, x_q8_1, y, n_in, n_out); break;
         case 2: launch_n<F, 2>(q, weights, x_q8_1, y, n_in, n_out); break;
@@ -674,6 +893,14 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
         case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out); break;
         case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out); break;
         case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 9: launch_n<F, 9>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 10: launch_n<F, 10>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 11: launch_n<F, 11>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 12: launch_n<F, 12>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 13: launch_n<F, 13>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 14: launch_n<F, 14>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 15: launch_n<F, 15>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 16: launch_n<F, 16>(q, weights, x_q8_1, y, n_in, n_out); break;
     }
 }
 
@@ -690,8 +917,9 @@ bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, fl
     validate_pointer(y1);
     validate_pointer(y2);
     auto& q = validate_stream(stream);
+    if (slm_try<F>(q, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols)) return true;
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
-    if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;
+    if (ncols > MMVQ_TILE_COLS || (ncols > 1 && !g_multi_exact) || steps > 10) return false;
     switch (ncols) {
         case 1: launch_row<F, 1, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
         case 2: launch_row<F, 2, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
@@ -744,11 +972,101 @@ struct Q80RowTraits {
     }
 };
 using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
+template <> constexpr int kSlmType<Q40Traits> = 2;
+template <> constexpr int kSlmType<Q50Traits> = 6;
+template <> constexpr int kSlmType<Q80Traits> = 8;
+template <> constexpr int kSlmType<Q2KTraits> = 10;
+template <> constexpr int kSlmType<Q3KTraits> = 11;
+template <> constexpr int kSlmType<Q4KTraits> = 12;
+template <> constexpr int kSlmType<Q5KTraits> = 13;
+template <> constexpr int kSlmType<Q6KTraits> = 14;
+template <> constexpr int kSlmType<IQ4NLTraits> = 20;
+template <> constexpr int kSlmType<IQ4XSTraits> = 23;
+template <> constexpr int kSlmType<Q20Traits> = 42;
+template <> constexpr int kSlmType<Q6KRowTraits> = kNativeQ6KRows;
+template <> constexpr int kSlmType<Q80RowTraits> = kNativeQ8Rows;
 
 } // namespace
 
+std::vector<MmvqSlmRule> native_mmvq_slm_rules(const std::string& text) {
+    static constexpr std::pair<const char*, MmvqRole> roles[] = {
+        {"other", MmvqRole::other}, {"ssm_out", MmvqRole::ssm_out}, {"qkv", MmvqRole::qkv},
+        {"shexp_gu", MmvqRole::shexp_gu}, {"shexp_down", MmvqRole::shexp_down}, {"*", MmvqRole::any}};
+    static constexpr std::pair<const char*, int> types[] = {{"*", -1}, {"q6krows", kNativeQ6KRows}, {"q8rows", kNativeQ8Rows}};
+    const auto bad = [&](const std::string& r) {
+        return std::invalid_argument("STRATA_MMVQ_SLM_ROLES: \"" + r + "\" is not role:type:min-max:rows:sgs");
+    };
+    const auto num = [&](const std::string& v, const std::string& r) {
+        if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) throw bad(r);
+        return std::stoi(v);
+    };
+    std::vector<MmvqSlmRule> out;
+    for (std::size_t at = 0; at < text.size();) {
+        const std::size_t end = std::min(text.find(',', at), text.size());
+        const std::string r = text.substr(at, end - at);
+        at = end + 1;
+        std::vector<std::string> f;
+        for (std::size_t i = 0;;) {
+            const std::size_t j = r.find(':', i);
+            f.push_back(r.substr(i, j == std::string::npos ? std::string::npos : j - i));
+            if (j == std::string::npos) break;
+            i = j + 1;
+        }
+        const std::size_t dash = f.size() == 5 ? f[2].find('-') : std::string::npos;
+        if (dash == std::string::npos) throw bad(r);
+        const auto role = std::find_if(std::begin(roles), std::end(roles), [&](const auto& e) { return f[0] == e.first; });
+        const auto type = std::find_if(std::begin(types), std::end(types), [&](const auto& e) { return f[1] == e.first; });
+        if (role == std::end(roles)) throw bad(r);
+        out.push_back({role->second, type != std::end(types) ? type->second : num(f[1], r), num(f[2].substr(0, dash), r),
+                       num(f[2].substr(dash + 1), r), num(f[3], r), num(f[4], r)});
+    }
+    return out;
+}
+const MmvqSlm& native_mmvq_slm() {
+    if (!g_slm_read) {
+        MmvqSlm c;
+        c.on = env_int_or("STRATA_MMVQ_SLM", kMmvqSlmDefault.on) != 0;
+        c.rows = env_int_or("STRATA_MMVQ_SLM_ROWS", kMmvqSlmDefault.rows);
+        c.sgs = env_int_or("STRATA_MMVQ_SLM_SGS", kMmvqSlmDefault.sgs);
+        c.kb = env_int_or("STRATA_MMVQ_SLM_KB", kMmvqSlmDefault.kb);
+        c.grf = env_int_or("STRATA_MMVQ_SLM_GRF", kMmvqSlmDefault.grf);
+        const char* roles = std::getenv("STRATA_MMVQ_SLM_ROLES");
+        c.rules = native_mmvq_slm_rules(roles ? roles : kMmvqSlmRolesDefault);
+        check_slm(c);
+        g_slm = c;
+        g_slm_read = true;
+    }
+    return g_slm;
+}
+void native_mmvq_set_slm(const MmvqSlm& c) {
+    check_slm(c);
+    g_slm = c;
+    g_slm_read = true;
+}
+std::optional<MmvqSlmPick> native_mmvq_slm_pick(int type, int ncols) {
+    const MmvqSlm& c = native_mmvq_slm();
+    if (!c.on) return std::nullopt;
+    for (const auto& r : c.rules)
+        if ((r.role == MmvqRole::any || r.role == t_role) && (r.type == -1 || r.type == type) && ncols >= r.min_cols &&
+            ncols <= r.max_cols)
+            return MmvqSlmPick{c.rows ? c.rows : r.rows, c.sgs ? c.sgs : r.sgs, c.kb, c.grf};
+    return std::nullopt;
+}
+MmvqRole native_mmvq_role() { return t_role; }
+MmvqRole native_mmvq_set_role(MmvqRole r) { return std::exchange(t_role, r); }
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
+void native_mmvq_set_rows(int rows, int wg_rows) {
+    for (int r : {rows, wg_rows})
+        if (r != 1 && r != 2 && r != 4) throw std::invalid_argument("native MMVQ rows must be 1, 2 or 4");
+    g_mmvq_rows = rows;
+    g_mmvq_wg_rows = wg_rows;
+}
+void native_mmvq_set_tile_cols(int cols) {
+    if (cols != 8 && cols != 16) throw std::invalid_argument("native MMVQ tile columns must be 8 or 16");
+    g_mmvq_tile = cols;
+}
+int native_mmvq_rows() { return mmvq_rows(MAX_NCOLS); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);

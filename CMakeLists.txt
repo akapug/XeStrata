@@ -199,6 +199,22 @@ target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/in
 find_package(Threads REQUIRED)
 target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
 
+# ---- strata_kvib (homelab): parked conversations in other machines' RAM (src/core/kvib.cpp, kvib.hpp) - the folder
+# abstraction --conversation-save writes through, the daemon's store and the client's transports.  Host code only.
+# RDMA is built when rdma-core's headers are found (libibverbs-dev, librdmacm-dev), or under STRATA_KVIB_RDMA_INCLUDE;
+# the libraries are opened with dlopen at run time, so nothing links them.
+set(STRATA_KVIB_RDMA_INCLUDE "" CACHE PATH "a folder holding infiniband/verbs.h and rdma/rdma_cma.h (kvib's RDMA)")
+add_library(strata_kvib STATIC src/core/kvib.cpp src/core/kvib_rdma.cpp src/core/conversation_folder.cpp)
+target_include_directories(strata_kvib PUBLIC include)
+if(STRATA_KVIB_RDMA_INCLUDE)
+  target_include_directories(strata_kvib SYSTEM PRIVATE ${STRATA_KVIB_RDMA_INCLUDE})
+endif()
+target_link_libraries(strata_kvib PUBLIC strata_warnings Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+  add_executable(strata-kvib-store tools/kvib/kvib_store_main.cpp)
+  target_link_libraries(strata-kvib-store PRIVATE strata_kvib)
+endif()
+
 # `ngram.cpp` is the PLE hash and table geometry the GPU PLE block will share with the reader.
 add_library(strata_ngram STATIC src/kernels/ngram.cpp src/ngram/ple_reader.cpp)
 target_link_libraries(strata_ngram PUBLIC strata_platform strata_artifact)
@@ -364,7 +380,10 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
                                     src/kernels/xe/kv_q8.cpp src/kernels/xe/kv_q4.cpp
                                     src/kernels/xe/qsa_decode_attn.cpp src/kernels/xe/kv_stream.cpp
-                                    src/kernels/xe/gdn.cpp src/kernels/xe/gr.cpp src/kernels/xe/fused_gr.cpp
+                                    src/kernels/xe/param_table.cpp
+                                    src/kernels/xe/gdn.cpp src/kernels/xe/gr.cpp src/kernels/xe/fused_gr.cpp src/kernels/xe/fused_gr_win.cpp src/kernels/xe/hc_mmq.cpp
+                                    src/kernels/xe/fuse_counter.cpp
+                                    src/kernels/xe/l2_prefetch.cpp
                                     src/kernels/xe/cvec.cpp src/kernels/xe/verify_kernels.cpp
                                     src/kernels/xe/s_gemv.cpp src/kernels/xe/s2_gemv.cpp
                                     src/kernels/xe/shared_expert.cpp src/kernels/xe/sampler.cpp
@@ -392,9 +411,10 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/pcie_split.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
+                                   src/core/conversation_park_queue.cpp src/core/conversation_prefetch.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_kvib)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
@@ -429,7 +449,7 @@ if(STRATA_ENABLE_XE)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
-    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test vmm_test)
+    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test vmm_test host_pin_ledger_test)
       add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
       target_link_libraries(${core_gpu_test} PRIVATE strata_engine)
       add_test(NAME ${core_gpu_test} COMMAND ${core_gpu_test})
@@ -451,10 +471,21 @@ if(STRATA_ENABLE_XE)
     endif()
     # a parked conversation's K/V and running state saved and restored byte for byte in every KV format and
     # residency mode (on the GPU), and invalid images refused before any write (host only)
+    # homelab kvib: a streamed layer parked in the store and put back reads the same K/V and attends bitwise the same
+    add_executable(conversation_kvib_parity src/core/conversation_kvib_parity.cpp)
+    target_link_libraries(conversation_kvib_parity PRIVATE strata_engine)
+    add_test(NAME conversation_kvib_parity COMMAND conversation_kvib_parity)
+    set_tests_properties(conversation_kvib_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
     add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
     set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # homelab shared prefix (STRATA_SHARED_PREFIX): a session started from another's prefix holds what a read of it
+    # leaves, in every KV format and residency mode, and the source is never changed (synthetic reads, no model)
+    add_executable(shared_prefix_parity src/core/shared_prefix_parity.cpp)
+    target_link_libraries(shared_prefix_parity PRIVATE strata_engine)
+    add_test(NAME shared_prefix_parity COMMAND shared_prefix_parity)
+    set_tests_properties(shared_prefix_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(conversation_validation_test src/core/conversation_validation_test.cpp)
     target_link_libraries(conversation_validation_test PRIVATE strata_engine)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
@@ -598,6 +629,59 @@ if(STRATA_ENABLE_XE)
   add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
+  # STRATA_MMVQ_ROWS: native_mmvq's 2, 4 and 8 rows a sub-group against the 1-row layout (memcmp), and their times;
+  # built beside the engine (the tests are often off in device builds)
+  add_executable(mmvq_rows_parity src/kernels/mmvq_rows_parity.cpp)
+  target_link_libraries(mmvq_rows_parity PRIVATE strata_kernels)
+  add_executable(mmvq_slm_parity src/kernels/mmvq_slm_parity.cpp)
+  target_link_libraries(mmvq_slm_parity PRIVATE strata_kernels)
+  # one device image a kernel: the OpenCL CPU device (STRATA_TEST_CPU_DEVICE) then builds only the kernels it runs,
+  # not the library's thousands at once (which took past a 12 GiB container)
+  target_link_options(mmvq_slm_parity PRIVATE -fsycl-device-code-split=per_kernel)
+  # STRATA_BATCH_GDN_FORM: every form of the slots' recurrence against the per-slot loop (memcmp), timed
+  add_executable(gdn_slots_parity src/kernels/gdn_slots_parity.cpp)
+  target_link_libraries(gdn_slots_parity PRIVATE strata_kernels)
+  # homelab pad rows (STRATA_BATCH_PAD_KEEPS_IDLE): an idle slot's row in a group window leaves its GDN, PLE, K/V and
+  # indexer state byte for byte through N windows (memcmp; runs on the OpenCL CPU device)
+  add_executable(pad_rows_parity src/kernels/pad_rows_parity.cpp)
+  target_link_libraries(pad_rows_parity PRIVATE strata_kernels)
+  target_link_options(pad_rows_parity PRIVATE -fsycl-device-code-split=per_kernel)
+  # STRATA_BATCH_QSA_STREAMED: streamed rows' window appends and kv_stream_resolve_slots against the per-row calls
+  add_executable(kv_stream_slots_parity src/kernels/kv_stream_slots_parity.cpp)
+  target_link_libraries(kv_stream_slots_parity PRIVATE strata_kernels)
+  # STRATA_HC_Q8_WIN: a window's Q8_0 hyper-connection read in one pass (every form) against passes of 8 (memcmp), timed
+  add_executable(hc_read16_parity src/kernels/hc_read16_parity.cpp)
+  target_link_libraries(hc_read16_parity PRIVATE strata_kernels)
+  # STRATA_QSA_ATTN_LANES: the decode attention's chunk pass a cell a lane against today's kernel (memcmp, every format
+  # and entry point), timed at 1..32 rows
+  add_executable(qsa_attn_lanes_parity src/kernels/qsa_attn_lanes_parity.cpp)
+  target_link_libraries(qsa_attn_lanes_parity PRIVATE strata_kernels)
+  # homelab: the hc read's bimodal ubench time at 16 rows: buffer placement, process state, clock or the L2 flush
+  add_executable(hc_mode_probe src/kernels/hc_mode_probe.cpp)
+  target_link_libraries(hc_mode_probe PRIVATE strata_kernels)
+  # homelab K2: a recorded graph's per-node dispatch cost (empty, wide, doorbell wait, mapped copies, stamps), the
+  # one-launch hand-off against 48, and the host's submit and round-trip costs; a device probe, not a CTest case
+  add_executable(graph_dispatch_probe src/kernels/graph_dispatch_probe.cpp)
+  target_link_libraries(graph_dispatch_probe PRIVATE strata_kernels)
+  # homelab small kernels: STRATA_GDN_AB_FORM, STRATA_MMVF_WIDE, STRATA_ROUTER_FUSE against the established calls
+  # (memcmp, and FP64), timed at 1, 7 and 16 rows
+  add_executable(fuse_small_parity src/kernels/fuse_small_parity.cpp)
+  target_link_libraries(fuse_small_parity PRIVATE strata_kernels)
+  # homelab: one batch-window layer's kernels timed at 1..16 rows on synthetic weights of the model's real shapes and
+  # types (tools/batch_window_spec.py writes the spec from the GGUF header); a benchmark, not a CTest case
+  add_executable(batch_window_ubench src/kernels/batch_window_ubench.cpp)
+  target_link_libraries(batch_window_ubench PRIVATE strata_kernels)
+  # homelab: native_expert_grouped's faster paths (STRATA_EXPERT_*) against the control, bitwise at 1..16 rows for every
+  # expert type pair of Qwen3.8-Flash-Next, and both timed; a device check, not a CTest case (device builds have no tests)
+  add_executable(expert_grouped_parity src/kernels/expert_grouped_parity.cpp)
+  target_link_libraries(expert_grouped_parity PRIVATE strata_kernels)
+  # STRATA_GDN_BLOCK_GRF: the per-slot recurrence and the state commit against today's kernels (memcmp), timed
+  add_executable(gdn_step_parity src/kernels/gdn_step_parity.cpp)
+  target_link_libraries(gdn_step_parity PRIVATE strata_kernels)
+  # every kernel of strata_kernels built for the device, for the GPU compiler's spill reports
+  add_executable(kernel_spill_audit src/kernels/kernel_spill_audit.cpp)
+  target_link_libraries(kernel_spill_audit PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,strata_kernels>")
+
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
@@ -639,6 +723,12 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(iq_mmq_parity PRIVATE strata_kernels strata_kernels_cpu)
     add_test(NAME iq_mmq_parity COMMAND iq_mmq_parity --selftest)
     set_tests_properties(iq_mmq_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # homelab K1 (STRATA_BATCH_DENSE_XMX): iq_mmq_decode, the decode window's dense products on Xe2's XMX, against FP64
+    # through ggml's dequantizers and against iq_mmq_grouped, at 1..16 rows on Flash-Next's shapes, then timed
+    add_executable(dmmq_parity src/kernels/dmmq_parity.cpp)
+    target_include_directories(dmmq_parity PRIVATE third_party/main/ggml)
+    target_link_libraries(dmmq_parity PRIVATE strata_kernels strata_kernels_cpu)
+    target_compile_options(dmmq_parity PRIVATE -fno-fast-math -ffp-contract=off)
     add_executable(rope_parity src/kernels/rope_parity.cpp)
     target_link_libraries(rope_parity PRIVATE strata_kernels)
     add_test(NAME rope_parity COMMAND rope_parity --selftest)
@@ -674,6 +764,13 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
     target_link_libraries(kv_steps_parity PRIVATE strata_kernels)
     add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
+    # STRATA_BATCH_QSA_ROWS: the batch window's one-launch QSA rows (_slots kernels) against the per-row calls, memcmp
+    add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
+    target_link_libraries(qsa_slots_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_slots_parity COMMAND qsa_slots_parity)
+    add_executable(session_slots_parity src/core/session_slots_parity.cpp)
+    target_link_libraries(session_slots_parity PRIVATE strata_engine)
+    add_test(NAME session_slots_parity COMMAND session_slots_parity)
     # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay
     add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
     target_link_libraries(native_multi_parity PRIVATE strata_kernels)
@@ -742,6 +839,19 @@ add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.c
             src/spec/draft_source.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
+  # The decode XMX entrypoint's shape and parity-oracle contracts, without SYCL or a device.
+  add_executable(dmmq_contract_test src/kernels/dmmq_contract_test.cpp)
+  target_include_directories(dmmq_contract_test PRIVATE include)
+  target_link_libraries(dmmq_contract_test PRIVATE strata_warnings)
+  add_test(NAME dmmq_contract_test COMMAND dmmq_contract_test)
+  add_executable(dmmq_dispatch_test src/kernels/dmmq_dispatch_test.cpp)
+  target_include_directories(dmmq_dispatch_test PRIVATE include)
+  target_link_libraries(dmmq_dispatch_test PRIVATE strata_warnings)
+  add_test(NAME dmmq_dispatch_test COMMAND dmmq_dispatch_test)
+  add_executable(hc_dispatch_test src/kernels/hc_dispatch_test.cpp)
+  target_include_directories(hc_dispatch_test PRIVATE include)
+  target_link_libraries(hc_dispatch_test PRIVATE strata_warnings)
+  add_test(NAME hc_dispatch_test COMMAND hc_dispatch_test)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
@@ -760,11 +870,27 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
   # the layer split's pure rules (header-only, no GPU; upstream 1c6c82ef, cb6c549c, a22a0e8c): the automatic split's
   # minimum stage size, the --batch-groups resolution and which path builds the draft layer's prompt K/V
-  foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test)
+  # window-row prefill (homelab, STRATA_BATCH_PREFILL): the settings, the BGEN parse, the slot prefix, the turn cut and
+  # the window plan; shared-prefix reuse across slots (homelab, STRATA_SHARED_PREFIX): the settings, the learned cut,
+  # the root registry's limits, which slots are sources and when a window slot starts from another's root; the slot park
+  # (homelab kvib, STRATA_SLOT_PARK): its settings, which admissions overwrite an idle slot's conversation
+  foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test window_prefill_test shared_prefix_test
+                    slot_park_test)
     add_executable(${rule_test} src/program/${rule_test}.cpp)
     target_include_directories(${rule_test} PRIVATE include)
     add_test(NAME ${rule_test} COMMAND ${rule_test})
   endforeach()
+  # homelab kvib: --conversation-save in other machines' RAM - the store's wire and semantics over the in-process and
+  # the loopback TCP transports, and a parked conversation's .xsc bytes identical in a folder and in the store (host only)
+  add_executable(conversation_kvib_test src/core/conversation_kvib_test.cpp src/core/conversation_disk.cpp
+                 src/core/conversation_park_queue.cpp src/core/conversation_prefetch.cpp)
+  target_include_directories(conversation_kvib_test PRIVATE include)
+  target_link_libraries(conversation_kvib_test PRIVATE strata_kvib)
+  add_test(NAME conversation_kvib_test COMMAND conversation_kvib_test)
+  add_executable(kvib_bench tools/kvib/kvib_bench.cpp src/core/conversation_disk.cpp
+                 src/core/conversation_park_queue.cpp src/core/conversation_prefetch.cpp)
+  target_include_directories(kvib_bench PRIVATE include)
+  target_link_libraries(kvib_bench PRIVATE strata_kvib)
   # --serve's parked conversations (upstream ccc660b-cecf697): the cache's ownership and matching, and the RAM
   # admission's MemAvailable parsing (host only)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)

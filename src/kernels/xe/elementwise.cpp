@@ -257,6 +257,37 @@ namespace {
 struct MappedCopies { MappedCopy c[8]; };
 }  // namespace
 
+namespace {
+struct RowsCopies { RowsCopy c[4]; };
+}  // namespace
+
+void copy_rows_mapped_multi(const RowsCopy* pieces, int n_pieces, int rows, void* stream) {
+    if (n_pieces <= 0 || rows <= 0) return;
+    if (n_pieces > 4) throw core::DeviceError("copy_rows_mapped_multi: at most 4 pieces");
+    RowsCopies a{};
+    int64_t most = 0;
+    for (int i = 0; i < n_pieces; ++i) {
+        const RowsCopy& c = pieces[i];
+        if ((c.n & 3) != 0 || (c.dst_stride & 3) != 0 || (c.src_stride & 3) != 0 || ((uintptr_t) c.dst & 15) != 0 ||
+            ((uintptr_t) c.src & 15) != 0)
+            throw core::DeviceError("copy_rows_mapped_multi: n and strides multiples of 4, pointers 16-byte aligned");
+        a.c[i] = c;
+        most = std::max<int64_t>(most, c.n);
+    }
+    const int64_t units = most / 4;
+    const size_t bx = (size_t) std::clamp<int64_t>((units + 255) / 256, 1, 16);
+    const size_t np = (size_t) n_pieces;
+    queue_for(stream).parallel_for(sycl::nd_range<2>({(size_t) rows * np, bx * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+        const size_t gi = it.get_group(0);
+        const RowsCopy c = a.c[gi % np];
+        const int64_t r = (int64_t) (gi / np);
+        const int64_t i0 = (int64_t) it.get_global_id(1), st = (int64_t) it.get_global_range(1);
+        f32x4* d = reinterpret_cast<f32x4*>(c.dst + r * c.dst_stride);
+        const volatile f32x4* s = reinterpret_cast<const volatile f32x4*>(c.src + r * c.src_stride);
+        for (int64_t i = i0; i < c.n / 4; i += st) d[i] = s[i];
+    });
+}
+
 // upstream 4a5713fb: the draft graphs' inputs from mapped memory in one launch instead of one each
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     if (n <= 0) return;

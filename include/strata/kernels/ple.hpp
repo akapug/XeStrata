@@ -120,7 +120,9 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 /// normalized[c] at row NG_HIST-1. One thread owns each channel, making the in-place shift well-defined.
 /// hist and normalized must be nonnull, disjoint device regions of NG_HIST*NG_HC_DIM and NG_HC_DIM floats.
 /// Async on stream, allocation-free and capture-safe. Throws on null or overlapping regions.
-void ple_history_advance(float* hist, const float* normalized, void* stream);
+/// `keep` (device int32, optional): when *keep == 0 the history is left as it is (a batch window's pad row for an
+/// idle slot must not advance that slot's history).
+void ple_history_advance(float* hist, const float* normalized, void* stream, const int32_t* keep = nullptr);
 
 /// Whether the CUDA path is available.  The host hash and the table read work without it; the block does not.
 bool ple_block_available();

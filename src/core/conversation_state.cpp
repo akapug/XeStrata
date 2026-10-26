@@ -44,6 +44,8 @@ ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) 
     o.imgs = c.imgs;
     o.used = c.used;
     o.pinned = c.pinned;
+    o.origin = c.origin;
+    o.shared = c.shared;
     o.gdn = copy_beating(c.gdn);
     o.ple = copy_beating(c.ple);
     o.tails = copy_beating(c.tails);
@@ -315,6 +317,111 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
     return sync(error);
+}
+
+bool conversation_checkpoint_restore_on(const ConversationCheckpoint& c, SessionState& ss, const ModelGeometry& g,
+                                        void* stream, std::string& error) {
+    if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    bool ok = true;
+    auto put = [&](void* dst, const void* src, size_t bytes) {
+        if (!ok || bytes == 0) return;
+        ok = dst != nullptr && src != nullptr && strata::gpu::copy_async(dst, src, bytes, stream);
+    };
+    put(ss.gdn_state, c.gdn.data(), c.gdn.size());
+    put(ss.ple_hist, c.ple.data(), c.ple.size());
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j) {
+        const auto& st = owned(ss, j);
+        put(st.idx_tail, c.tails.data() + j * z.tail, z.tail);
+        put(st.idx_dead, c.dead.data() + j * z.dead, z.dead);
+        put(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos);
+        if (!c.ids.empty()) {   // as conversation_checkpoint_restore: the spare indexer row from the dead keys
+            const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            put(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead);
+        }
+    }
+    if (!ok || !strata::gpu::stream_sync(stream))
+        return fail(error, "restoring a running state on a stream failed");
+    const size_t tokens = c.ids.size();
+    ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
+    ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
+    return true;
+}
+
+bool conversation_prefix_copy(const ConversationCheckpoint& at, const SessionState& from, SessionState& to,
+                              const ModelGeometry& g, void* stream, std::string& error) {
+    const size_t layers = owned_qsa(from, g);
+    if (layers != owned_qsa(to, g) || (layers && (!from.qsa_states || !to.qsa_states)) ||
+        (carved(from) && carved(to) && from.qsa_ord0 != to.qsa_ord0))
+        return fail(error, "prefix copy between sessions of different carves");
+    if (!conversation_checkpoint_validate(at, to, g, error)) return false;
+    const auto upto = (int64_t) at.ids.size();
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_copy_on(owned(from, j), owned(to, j), g, upto, true, stream, error)) return false;
+    if (stream != nullptr) return conversation_checkpoint_restore_on(at, to, g, stream, error);
+    return sync(error) && conversation_checkpoint_restore(at, to, g, error);
+}
+
+bool conversation_slot_read_back(const ConversationCheckpoint* at, const std::vector<int32_t>& ids,
+                                 const SessionState& from, SessionState& to, const ModelGeometry& g, bool direct,
+                                 std::string& error) {
+    if (at != nullptr && direct) return conversation_prefix_copy(*at, from, to, g, nullptr, error);
+    const size_t layers = owned_qsa(from, g);
+    if (layers != owned_qsa(to, g) || (layers && (!from.qsa_states || !to.qsa_states)) ||
+        (carved(from) && carved(to) && from.qsa_ord0 != to.qsa_ord0))
+        return fail(error, "slot read-back between sessions of different carves");
+    if (at != nullptr && !conversation_checkpoint_validate(*at, to, g, error)) return false;
+    const auto upto = (int64_t) (at != nullptr ? at->ids.size() : ids.size());
+    for (size_t j = 0; j < layers; ++j) {   // the K/V first: its pooled rows include the moving spare row
+        if (direct) {
+            if (!conversation_kv_copy(owned(from, j), owned(to, j), g, upto, true, error)) return false;
+            continue;
+        }
+        ConversationKv img;
+        if (!conversation_kv_save(img, owned(from, j), g, upto, true, error) || !sync(error) ||
+            !conversation_kv_restore(img, owned(to, j), g, upto, true, error))
+            return false;
+    }
+    if (!sync(error)) return false;
+    if (at != nullptr) {   // then the running state over it (the spare row from the checkpoint's dead keys)
+        if (!conversation_checkpoint_restore(*at, to, g, error)) return false;
+    } else if (direct) {
+        if (!conversation_state_copy(ids, from, to, g, error)) return false;
+    } else {
+        ConversationCheckpoint ck;
+        ck.ids = ids;
+        if (!conversation_checkpoint_save(ck, from, g, error) || !conversation_checkpoint_restore(ck, to, g, error))
+            return false;
+    }
+    return sync(error);
+}
+
+bool conversation_state_copy(const std::vector<int32_t>& ids, const SessionState& from, SessionState& to,
+                             const ModelGeometry& g, std::string& error) {
+    ConversationStateSizes a, b;
+    if (!checkpoint_targets(from, g, ids.size(), a, error) || !checkpoint_targets(to, g, ids.size(), b, error))
+        return false;
+    const size_t layers = owned_qsa(from, g);
+    if (a.gdn != b.gdn || a.ple != b.ple || a.tail != b.tail || a.dead != b.dead || a.block_pos != b.block_pos ||
+        layers != owned_qsa(to, g) || !from.ple_hist != !to.ple_hist)
+        return fail(error, "running-state copy between sessions of different geometry");
+    if (!copy(to.gdn_state, from.gdn_state, a.gdn, error) ||
+        !copy(to.ple_hist, from.ple_hist, from.ple_hist ? a.ple : 0, error)) return false;
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& x = owned(from, j);
+        const auto& y = owned(to, j);
+        if (!copy(y.idx_tail, x.idx_tail, a.tail, error) || !copy(y.idx_dead, x.idx_dead, a.dead, error) ||
+            !copy(y.idx_block_pos, x.idx_block_pos, a.block_pos, error)) return false;
+        if (!ids.empty()) {   // as conversation_checkpoint_restore: the spare indexer row from the dead keys
+            const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+            if (!copy(y.idx_pooled + row * g.idx_key_dim, x.idx_dead, a.dead, error)) return false;
+        }
+    }
+    const size_t tokens = ids.size();
+    to.ple_prev[0] = tokens >= 2 ? ids[tokens - 2] : -1;
+    to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
+    return true;
 }
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,

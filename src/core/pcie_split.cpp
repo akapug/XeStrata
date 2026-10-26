@@ -61,7 +61,7 @@ struct PcieFetchProbe {
             if (a == nullptr) {
                 const uint8_t* b = d.src->blob(layer, e);
                 if (b == nullptr) continue;
-                if (host == nullptr && !strata::gpu::alloc_host(&host, (size_t) (kRing * bytes))) {
+                if (host == nullptr && !strata::gpu::alloc_host(&host, (size_t) (kRing * bytes), "pcie-split")) {
                     why = "no host USM for the timing";
                     return false;
                 }

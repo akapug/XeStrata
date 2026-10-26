@@ -97,8 +97,8 @@ static int check_bf16_embd(void* s) {
 
 // One expert three ways (see the top): the float reference, the CPU and the GPU, on `blob` (gate rows, up rows, down
 // rows in the formats of `f`) and NT random activations; prints one line, `label` and `l` first.  Returns its failures.
-static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob, const cpu::NativeFmt& f, void* s) {
-    const int NT = 3;
+template<int NT>
+static int check_blob_rows(const char* label, int l, const std::vector<uint8_t>& blob, const cpu::NativeFmt& f, void* s) {
     const int64_t H = f.n_embd, FF = f.n_ff;
     int failures = 0;
     // (a) the float reference
@@ -325,7 +325,9 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         par::copy_bytes_in(dblob, blob.data(), blob.size());
         par::copy_bytes_in(dx, x.data(), x.size() * 4);
         const unsigned long long p = (unsigned long long) dblob;
-        const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+        const int32_t st[2] = {0, NT}, one = 1;
+        int32_t idx[NT];
+        for (int i = 0; i < NT; ++i) idx[i] = i;
         par::copy_bytes_in(dptr, &p, 8);
         par::copy_bytes_in(dstart, st, 8);
         par::copy_bytes_in(dn, &one, 4);
@@ -423,6 +425,17 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
                 ok ? "ok" : "FAIL");
     if (!ok) ++failures;
     return failures;
+}
+
+// The default fixture is unchanged. Opt in to a partial/full wide tile in the
+// existing parity tool. Stay within the CPU canonical kernels' eight-row arrays.
+static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob, const cpu::NativeFmt& f, void* s) {
+    const char* rows = std::getenv("STRATA_GROUPED_TEST_ROWS");
+    if (rows == nullptr || std::strcmp(rows, "3") == 0) return check_blob_rows<3>(label, l, blob, f, s);
+    if (std::strcmp(rows, "8") == 0) return check_blob_rows<8>(label, l, blob, f, s);
+    if (std::strcmp(rows, "7") == 0) return check_blob_rows<7>(label, l, blob, f, s);
+    std::fprintf(stderr, "STRATA_GROUPED_TEST_ROWS must be 3 (default), 7 or 8\n");
+    return 1;
 }
 
 // A fixed sequence for the synthetic weights (a std engine seeded with a constant draws a lint warning).

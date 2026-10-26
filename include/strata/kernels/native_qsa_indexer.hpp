@@ -71,4 +71,27 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
                                             int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+/// A batch window's appends of one layer for every slot group in one launch (STRATA_BATCH_QSA_ROWS).  Group j covers
+/// window rows [first[j], first[j] + ntok[j]) (raw + row * idx_dim, position at relative_pos_device[row * pos_stride])
+/// and appends them in order into its own buffers, of capacity max_cells[j]; with snap[j] set it first copies its tail
+/// there (the window's snapshot for the commit, as copy_from_mapped did).  The same stores as the per-row calls.
+/// The kernel reads the table from device memory (src/kernels/xe/param_table.hpp): 1672 bytes at 32 rows is too close
+/// to the B70's 2048 bytes of kernel arguments to stay an argument.
+struct QsaIndexerSlots {
+    static constexpr int kMax = kQsaSlotsMax;
+    float* snap[kMax] = {};
+    float* tail[kMax] = {};
+    float* dead[kMax] = {};
+    float* pooled[kMax] = {};
+    int32_t* block_pos[kMax] = {};
+    int first[kMax] = {};
+    int ntok[kMax] = {};
+    int max_cells[kMax] = {};
+    int n = 0;
+    int pad = 0;   ///< no padding: the kernel takes the table by pointer to a device copy keyed by its bytes
+};
+void native_qsa_indexer_append_slots(const float* raw, const int32_t* relative_pos_device, int pos_stride,
+                                     int32_t pos_base, const float* gamma, float epsilon, const QsaIndexerSlots& slots,
+                                     const QsaShapes& shapes, const RopeScaling& scaling, void* stream);
+
 } // namespace strata::kernels

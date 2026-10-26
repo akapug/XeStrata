@@ -28,6 +28,7 @@ argmax==target, logp(<|im_end|>), logp(target without <|im_end|>), then 64 `id:l
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -183,8 +184,9 @@ PROMPT_LENS = (256, 512, 768, 1000)
 def cmd_prompt(a) -> int:
     """The batched prompt path's answer: every segment's first 256 / 512 / 768 / 1000 tokens as a prompt (one request
     each, no prompt cache), and the logits after it (STRATA_DUMP_FIRST_LOGITS: float32, the whole vocabulary)."""
-    cfg = json.load(open(a.config, encoding="utf-8-sig"))
-    st = json.load(open(a.ids))
+    cfg = json.loads(pathlib.Path(a.config).read_text(encoding="utf-8-sig"))
+    ids_bytes = pathlib.Path(a.ids).read_bytes()
+    st = json.loads(ids_bytes)
     out = pathlib.Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     for f in out.glob("first.*"):
@@ -238,7 +240,8 @@ def cmd_prompt(a) -> int:
     except subprocess.TimeoutExpired:
         p.kill()
     errf.close()
-    (out / "index.json").write_text(json.dumps({"requests": index, "args": args, "env": a.env or []}, indent=1))
+    (out / "index.json").write_text(json.dumps({"requests": index, "args": args, "env": a.env or [],
+                                              "ids_sha256": hashlib.sha256(ids_bytes).hexdigest()}, indent=1))
     print(f"{len(index)} prompts")
     return 0
 
@@ -246,30 +249,58 @@ def cmd_prompt(a) -> int:
 def cmd_pcompare(a) -> int:
     import numpy as np
     ref = pathlib.Path(a.ref)
-    idx = json.loads((ref / "index.json").read_text())["requests"]
+    ri = json.loads((ref / "index.json").read_text())
+    idx = ri["requests"]
+    if not isinstance(idx, list) or not idx:
+        raise ValueError(f"{ref}: no prompt requests")
+    ids_hash = ri.get("ids_sha256", "")
+    if len(ids_hash) != 64 or any(c not in "0123456789abcdef" for c in ids_hash):
+        raise ValueError(f"{ref}: missing fixed-input ids_sha256; rerun prompt with this verifier")
+    max_kl, min_top1 = a.max_mean_kl, a.min_top1
+    if max_kl is not None and (not math.isfinite(max_kl) or max_kl < 0):
+        raise ValueError("--max-mean-kl must be finite and nonnegative")
+    if min_top1 is not None and (not math.isfinite(min_top1) or not 0 <= min_top1 <= 1):
+        raise ValueError("--min-top1 must be a finite fraction in [0, 1]")
 
     def logp(d, i):
-        x = np.fromfile(d / f"first.{i}", dtype=np.float32).astype(np.float64)
+        p = d / f"first.{i}"
+        if p.stat().st_size == 0 or p.stat().st_size % np.dtype(np.float32).itemsize:
+            raise ValueError(f"{p}: empty or truncated float32 logits")
+        x = np.fromfile(p, dtype=np.float32).astype(np.float64)
+        if not np.isfinite(x).all():
+            raise ValueError(f"{p}: nonfinite logits")
         x -= x.max()
         return x - np.log(np.exp(x).sum())
 
-    print(f"reference: {ref}")
+    print(f"reference: {ref}; fixed ids SHA256 {ids_hash}")
+    failed = False
     for run in a.runs:
         r = pathlib.Path(run)
+        ci = json.loads((r / "index.json").read_text())
+        if ci.get("requests") != idx or ci.get("ids_sha256") != ids_hash:
+            raise ValueError(f"{r}: prompt requests or fixed input identity differ from reference")
         kls, agree = [], 0
+        vocab = None
         for i in range(len(idx)):
-            if not (r / f"first.{i}").exists():
-                continue
             lr, la = logp(ref, i), logp(r, i)
+            if lr.shape != la.shape or (vocab is not None and len(lr) != vocab):
+                raise ValueError(f"{r}: vocabulary differs at prompt {i}")
+            vocab = len(lr)
             pr = np.exp(lr)
-            kls.append(float((pr * (lr - la)).sum()))
+            kl = float((pr * (lr - la)).sum())
+            if not math.isfinite(kl):
+                raise ValueError(f"{r}: nonfinite KL at prompt {i}")
+            kls.append(kl)
             agree += int(lr.argmax() == la.argmax())
         kls.sort()
         n = len(kls)
-        print(f"{r.name:40s} prompts {n:3d}  top-1 {100 * agree / max(n, 1):6.2f}%  "
-              f"KL mean {sum(kls) / max(n, 1):.5f}  "
-              f"median {kls[n // 2] if n else float('nan'):.5f}  max {kls[-1] if n else float('nan'):.5f}")
-    return 0
+        mean_kl, top1 = sum(kls) / n, agree / n
+        rejected = (max_kl is not None and mean_kl > max_kl) or (min_top1 is not None and top1 < min_top1)
+        failed |= rejected
+        print(f"{r.name:40s} prompts {n:3d}  top-1 {100 * top1:6.2f}%  "
+              f"KL mean {mean_kl:.5f}  median {kls[n // 2]:.5f}  max {kls[-1]:.5f}"
+              f"{'  REJECT' if rejected else ''}")
+    return int(failed)
 
 
 # ------------------------------------------------------------------------------------------------ compare
@@ -381,6 +412,8 @@ def main() -> int:
     p = sub.add_parser("pcompare", help="full-vocabulary KL and top-1 of `prompt` directories against a reference one")
     p.add_argument("ref")
     p.add_argument("runs", nargs="+")
+    p.add_argument("--max-mean-kl", type=float, help="reject a run above this mean full-vocabulary KL")
+    p.add_argument("--min-top1", type=float, help="reject a run below this prompt next-token agreement fraction")
     a = ap.parse_args()
     return {"ids": cmd_ids, "run": cmd_run, "prompt": cmd_prompt, "compare": cmd_compare,
             "pcompare": cmd_pcompare}[a.cmd](a)

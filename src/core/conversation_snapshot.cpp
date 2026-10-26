@@ -204,6 +204,21 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     return true;
 }
 
+namespace {
+// VRAM slots still contain the outgoing conversation. Resolve must refill
+// them from the restored authoritative pools before any attention reads.
+void settle_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, void* stream = nullptr) {
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, stream);
+    }
+}
+} // namespace
+
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
     return conversation_kv_restore_prefix(image, st, g, upto, upto, index, error);
@@ -227,19 +242,45 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
-    // VRAM slots still contain the outgoing conversation. Resolve must refill
-    // them from the restored authoritative pools before any attention reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
-    if (st.kv_mode == 2 && upto > 0) {
-        auto shapes = strata::kernels::qsa_real_shapes();
-        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
-        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
-        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
-                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
-    }
+    settle_residency(st, g, upto);
     if (strata::gpu::device_sync()) return true;
     error = std::string("conversation snapshot residency restore: ") + strata::gpu::last_error();
     return false;
+}
+
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto, bool index,
+                          std::string& error) {
+    return conversation_kv_copy_on(from, to, g, upto, index, nullptr, error);
+}
+
+bool conversation_kv_copy_on(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto,
+                             bool index, void* stream, std::string& error) {
+    Layout a{}, b{};
+    if (!layout(from, g, upto, index, a, error) || !valid(from, a, upto, error) ||
+        !layout(to, g, upto, index, b, error) || !valid(to, b, upto, error))
+        return false;
+    const std::array<size_t,5> sizes = {a.data, a.value_data, a.scales, a.value_scales, a.pooled};
+    const std::array<size_t,5> want = {b.data, b.value_data, b.scales, b.value_scales, b.pooled};
+    if (a.format != b.format || a.cells != b.cells || a.pooled_rows != b.pooled_rows || a.page_size != b.page_size ||
+        sizes != want) {
+        error = "conversation snapshot: K/V copy between sessions of different geometry";
+        return false;
+    }
+    const auto src = pools(from), dst = pools(to);
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (stream == nullptr) {
+            if (!transfer(dst[i], src[i], sizes[i], error)) return false;
+            continue;
+        }
+        if (sizes[i] == 0) continue;
+        if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        if (!strata::gpu::copy_async(dst[i], src[i], sizes[i], stream)) {
+            error = std::string("conversation snapshot copy: ") + strata::gpu::last_error();
+            return false;
+        }
+    }
+    settle_residency(to, g, upto, stream);
+    return true;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

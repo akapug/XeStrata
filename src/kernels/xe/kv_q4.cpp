@@ -7,6 +7,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/core/runtime.hpp"
+#include "param_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q4
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -124,7 +125,41 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
     finish(stream, e, "kv_append_q4");
 }
 
-void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+void kv_append_q4_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, int n_steps, const float* kcur,
+                        const float* vcur, int planes, const QsaShapes& s, void* stream) {
+    if (n_steps <= 0) return;
+    need_256(s, "kv_append_q4_slots");
+    if (n_steps > kQsaSlotsMax || (planes != 1 && planes != 2) || !step)
+        throw core::DeviceError("kv_append_q4_slots: rows, planes or step out of range");
+    for (int j = 0; j < n_steps; ++j)
+        if (!tab.k[j] || !tab.page_table[j] || (planes == 2 && !tab.v[j]) || (tab.host_k[j] && planes == 2 && !tab.host_v[j]))
+            throw core::DeviceError("kv_append_q4_slots: a row's pools are missing");
+    const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
+    const KvAppendSlots* t_ = xe::device_table(queue_for(stream), tab);   // by pointer (param_table.hpp)
+    // kv_append_q4_steps' body; row j's blocks and page table from its table entry
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<3>({(size_t) n_steps * planes, (size_t) (head_dim / QK4_0), (size_t) kv_heads * WARP},
+                          {1, 1, WARP}),
+        xe::fits("kv_append_q4_slots", [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int j = (int) it.get_group(0) / planes;
+            const long long pos = (long long) step[(long long) j * step_stride + kStepPos];
+            const int h = (int) it.get_group(2), b = (int) it.get_group(1), t = (int) it.get_local_id(2);
+            const bool is_v = (int) it.get_group(0) % planes == 1;
+            const float x = (is_v ? vcur : kcur)[((long long) j * kv_heads + h) * head_dim + (long long) b * QK4_0 + t];
+            uint8_t byte;
+            const uint16_t d = q4_group(it.get_sub_group(), x, byte);
+            const long long page = (long long) t_->page_table[j][pos / page_size];
+            if (page >= 0)
+                q4_store(static_cast<uint8_t*>(is_v ? t_->v[j] : t_->k[j]),
+                         (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
+            if (t_->host_k[j] != nullptr)
+                q4_store(static_cast<uint8_t*>(is_v ? t_->host_v[j] : t_->host_k[j]),
+                         ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
+        }));
+    finish(stream, e, "kv_append_q4_slots");
+}
+
+void kv_append_q4_step(uint8_t* k_q4,uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host) {
     kv_append_q4_steps(k_q4, v_q4, page_table, step, 0, 1, kcur, vcur, s, stream, host);

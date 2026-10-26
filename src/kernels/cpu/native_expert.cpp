@@ -4,6 +4,7 @@
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
+#include <algorithm>
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -211,6 +212,11 @@ void part_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (nt > kExpertTileT) {
+        for (int t = 0; t < nt; t += kExpertTileT)
+            native_gu_rows(f, blob, act + t, std::min(nt - t, kExpertTileT), ff + t, r0, r1);
+        return;
+    }
     if (canon_layer(f)) { canon_gu_rows(f, blob, act, nt, ff, r0, r1); return; }
     if (f.gu_type == 42) {   // Q2_0: Strata's GGUF-layout kernels on the ActQ native_quant_act wrote
         thread_local float ub[MAXT][kNativeMaxFF];
@@ -281,6 +287,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (nt > kExpertTileT) {
+        for (int t = 0; t < nt; t += kExpertTileT)
+            native_down_rows(f, blob, hq + t, std::min(nt - t, kExpertTileT), out + t, r0, r1);
+        return;
+    }
     if (canon_layer(f)) { canon_down_rows(f, blob, hq, nt, out, r0, r1); return; }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one

@@ -87,10 +87,34 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.  `grid_groups` rows of groups
 /// are launched, each striding over the groups (0: cap_groups, a row per possible group); the results do not depend
 /// on it.
+/// STRATA_GROUPED_ENTRIES=4 (default/control), 1 or 2 (sparse-routing candidates),
+/// or 8 (experimental IQ3_XXS gate/up, IQ4_NL/Q2_0 down): share each decoded weight
+/// across that many entries per pass. Read once per process before capture; restart
+/// to change it. The 8-entry candidate keeps the control for other formats and
+/// capacities <=4. Mode 8 local-memory checks use the selected tile size; the existing
+/// non-local path is the fallback. No speed/parity claim.
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// homelab's faster paths of native_expert_grouped, each its own bit and setting (every one default off; the output is
+/// bitwise the control's with any of them, expert_grouped_parity checks it): see iq_kernels.cpp.
+constexpr int kNativeExpertFastIq2xsLds = 1;   // STRATA_EXPERT_IQ2XS_LDS
+constexpr int kNativeExpertFastIq4nlTable = 2;   // STRATA_EXPERT_IQ4NL_TABLE
+constexpr int kNativeExpertFastGridLean = 4;    // STRATA_EXPERT_GRID_LEAN
+constexpr int kNativeExpertFastGuBlocklane = 8;  // STRATA_EXPERT_GU_BLOCKLANE
+constexpr int kNativeExpertFastGroup = 16;      // STRATA_EXPERT_GROUP (tiles a work-group; not in All)
+constexpr int kNativeExpertFastAll = 15;
+/// The bits in force: the settings, or the override.
+int native_expert_fast_mask();
+/// Test seam: force the bits (expert_grouped_parity's A/B in one process); -1 returns to the settings.
+void native_expert_fast_override(int mask);
+/// Test seam: force the entries per pass (1, 2, 4, 8); -1 returns to the settings.
+/// A candidate's parity reference must use 4 explicitly, not the candidate setting.
+void native_expert_entries_override(int entries);
+/// Profiling seam: called (when set) on the stream after each of native_expert_grouped's launches with the launch's
+/// number (expert_grouped_parity --phases); nullptr (the default) for none.
+void native_expert_set_phase_hook(void (*hook)(void* stream, int phase));
 /// The same for BF16 experts (gate/up and down both BF16: qwen35moe's and qwen3moe's BF16 files), against the tokens'
 /// FP32 rows `x` (n_embd floats a token) as llama.cpp's float products take a BF16 weight; the same scratch.
 void native_expert_grouped_bf16(const NativeExpertLayout& L, const unsigned long long* grp_ptr,

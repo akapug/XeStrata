@@ -75,5 +75,17 @@ bool fused_gr_q8_fuse();
 constexpr int kFusedGrMaxT = 8;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+/// STRATA_HC_Q8_WIN (default 0, off): with the Q8_0 projections, a window of up to kVerifyMaxT tokens whose buffers are
+/// a base plus the token times a stride (all but R and R_out, as verify's) is read in one pass instead of passes of
+/// kFusedGrMaxT: 1 the established kernels, 2 the rewritten ones (fused_gr_win.cpp) in the shape measured fastest for
+/// the window's size, 3..9 fixed shapes (tests); 10..12 (homelab) form 2's shapes (11, 12: 4-row up shapes past 8
+/// tokens) with the lo sums in the down launch's tail, a launch fewer.  The outputs are bitwise the established path's.  Set before graph
+/// capture; for tests.
+constexpr int kFusedGrQ8WinForms = 13;
+void fused_gr_set_q8_win(int form);
+int fused_gr_q8_win();
+/// Tests only (the time of each launch): which launches the Q8_0 read runs, bit 1 down, 2 the lo reduction (forms 2
+/// and 3), 4 up; 7 (the default) all.
+void fused_gr_q8_set_parts(int mask);
 
 }  // namespace strata::kernels

@@ -43,6 +43,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -161,7 +162,9 @@ ANSWER_RESERVE_MIN = 512
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
-REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+REASONING_WRAP_UP_DEFAULT = "I have thought about this long enough; time to give my answer."
+REASONING_WRAP_UP = ("\n\n" + (os.environ.get("STRATA_REASONING_WRAP_UP") or REASONING_WRAP_UP_DEFAULT) +
+                     "\n</think>\n\n")
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -222,7 +225,36 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+# mixed slot contexts: the room a small slot must leave an open-ended request (no max_tokens) to answer in, else it
+# waits for a bigger slot
+SLOT_ROOM_MIN = int(os.environ.get("STRATA_SLOT_ROOM_MIN", "8192"))
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+
+
+def _prefetch_settings() -> tuple[bool, int]:
+    """homelab restore prefetch (the engine's STRATA_SLOT_PREFETCH, conversation_prefetch.hpp): with it 1, a --batch
+    request whose conversation no slot holds tells the engine its prompt (`PREFETCH [cvec=0|1] <ids>`, no answer) as it
+    starts waiting, so the engine reads the conversation's parked file while the request waits for a slot.  Only prompts
+    of at least STRATA_SLOT_PARK_MIN_TOKENS (2048, the engine's own minimum for a parked conversation).  Off by default;
+    a bad value is refused by name and keeps it off (the engine refuses the same values)."""
+    on = os.environ.get("STRATA_SLOT_PREFETCH") or "0"
+    if on not in ("0", "1"):
+        print(f"[strata] STRATA_SLOT_PREFETCH must be 0 or 1 (got {on!r}); the restore prefetch hints are off",
+              flush=True)
+        return False, 0
+    raw = os.environ.get("STRATA_SLOT_PARK_MIN_TOKENS") or "2048"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        print(f"[strata] STRATA_SLOT_PARK_MIN_TOKENS must be 1 or more (got {raw!r}); the restore prefetch hints are off",
+              flush=True)
+        return False, 0
+    return on == "1", n
+
+
+SLOT_PREFETCH, SLOT_PREFETCH_MIN_TOKENS = _prefetch_settings()
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -273,6 +305,13 @@ try:
 except ValueError:
     ADMIT_SHORT_FIRST = 0
 ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+# homelab: a BYIELD continuation may take priority at the next AVAILABLE control-line boundary after this queued
+# monotonic age. This includes time another read owns the lines: not pure decode time or a start/finish deadline.
+# Unset/0 keeps the existing lock/short-first policy; the current owner is never preempted. YIELDS_MAX is unchanged.
+BATCH_READ_REQUEUE_MAX_S_DEFAULT = 0.0
+BATCH_READ_REQUEUE_MAX_S = _timeout_env("STRATA_BATCH_READ_REQUEUE_MAX_S", BATCH_READ_REQUEUE_MAX_S_DEFAULT) or 0.0
+if not math.isfinite(BATCH_READ_REQUEUE_MAX_S):
+    BATCH_READ_REQUEUE_MAX_S = BATCH_READ_REQUEUE_MAX_S_DEFAULT
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -887,6 +926,7 @@ class StrataEngine:
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                           **pin)
+        self.generation = uuid.uuid4().hex   # this process, not the engine object that survives restart()
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -998,6 +1038,11 @@ class StrataEngine:
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
         self.slot_gs = gs if groups > 1 else 0   # pipelined groups: their size (pick_slot fills a group's holes)
+        # mixed slot contexts (engine --slot-context, --big-slots; INFO slot_context=N big_slots=K): the first K slots
+        # hold the whole context, the rest N cells.  pick_slot keeps the big ones for a conversation that needs them
+        small = int(self.info.get("slot_context") or 0)
+        big = int(self.info.get("big_slots") or 0) if 0 < small < self.max_context else self.batch
+        self.slot_ctx = [self.max_context if b < big else small for b in range(self.batch)]
         self.slot_q: list[queue.Queue] = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
@@ -1025,6 +1070,7 @@ class StrataEngine:
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
+        self._ctl_window = False                        # homelab: the last BADM said 2 (window-row prefill)
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self._ctl_mode, self._ctl_result, self._last_done = "solo", None, None
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -1176,6 +1222,26 @@ class StrataEngine:
         finally:
             if not done:
                 out.put(None)
+
+    def route_identity(self):
+        """Monitor-only identity of this worker and the wrapper's actual pipe handles.
+
+        This is a trusted-wrapper witness, not executable attestation. A collector must separately pin the
+        child process/start identity, executable and reciprocal directional pipe endpoints. No prompt tokens,
+        environment or credentials are added here. Non-pipe test/unsupported transports cannot attest a route.
+        """
+        proc = self.proc
+        if proc is None or proc.poll() is not None or not getattr(self, "generation", None):
+            return None
+        try:
+            pipes = [os.fstat(stream.fileno()) for stream in (proc.stdin, proc.stdout)]
+        except (AttributeError, OSError, ValueError):
+            return None
+        if not all(stat.S_ISFIFO(p.st_mode) for p in pipes):
+            return None
+        return {"wrapper_pid": os.getpid(), "worker_pid": proc.pid, "generation": self.generation,
+                "stdin_pipe": [pipes[0].st_dev, pipes[0].st_ino],
+                "stdout_pipe": [pipes[1].st_dev, pipes[1].st_ino]}
 
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
@@ -1366,8 +1432,11 @@ class StrataEngine:
                 self._parse_done(line)
                 self._last_done = line
             elif line.startswith("BADM "):
+                # 1: continues in the batch windows (its first token came as a T); 2 (homelab window-row prefill): its
+                # slot reads the prompt in the windows and the first token comes as a BT
                 f = line.split()
-                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                self._ctl_result = ("badm", len(f) >= 3 and f[2] in ("1", "2"))
+                self._ctl_window = len(f) >= 3 and f[2] == "2"
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
@@ -1525,26 +1594,29 @@ class StrataEngine:
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        entry = [plen, time.monotonic(), new, after_epoch, cancel]  # a non-None epoch identifies a BYIELD read
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
         beat = time.monotonic()
         try:
             while True:
+                if BATCH_READ_REQUEUE_MAX_S > 0 and cancel.is_set():
+                    return False
                 if not self.alive() and not getattr(self, "starting", False):
                     # #1012: the engine is gone and nobody is starting it again: this request was not sent, so it
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
-                    turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
-                    if turn and new and ADMIT_SHORT_FIRST > 0:
-                        turn = self._admit_next() is entry
+                    turn = self._control_turn(entry)
                 if turn and self.ctl.acquire(timeout=0.5):
-                    if new and ADMIT_SHORT_FIRST > 0:
-                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
-                            first = self._admit_next() is entry
+                    if BATCH_READ_REQUEUE_MAX_S > 0 and cancel.is_set():
+                        self.ctl.release()
+                        return False
+                    if BATCH_READ_REQUEUE_MAX_S > 0 or (new and ADMIT_SHORT_FIRST > 0):
+                        with self.slot_cv:              # priority may change while acquire() waits for the owner
+                            first = self._control_turn(entry)
                         if not first:
                             self.ctl.release()
                             with self.slot_cv:
@@ -1565,12 +1637,21 @@ class StrataEngine:
         finally:
             with self.slot_cv:
                 self.waiting = max(0, self.waiting - 1)
-                if entry in self.wait_lens:
-                    self.wait_lens.remove(entry)
+                self.wait_lens[:] = [e for e in self.wait_lens if e is not entry]
+                if BATCH_READ_REQUEUE_MAX_S > 0:
+                    self.slot_cv.notify_all()
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def _control_turn(self, entry):
+        """Same admission decision before/after taking ctl; caller holds slot_cv. Never preempts its owner."""
+        first = self._admit_next() if BATCH_READ_REQUEUE_MAX_S > 0 or (entry[2] and ADMIT_SHORT_FIRST > 0) else None
+        if BATCH_READ_REQUEUE_MAX_S > 0 and first is not None and len(first) > 3 and first[3] is not None:
+            return first is entry                     # overrides after_epoch: the due read must not await itself
+        turn = entry[3] is None or self.ctl_epoch > entry[3] or self.waiting <= 1
+        return turn and (not entry[2] or ADMIT_SHORT_FIRST <= 0 or first is entry)
 
     def _admit_next(self):
         """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
@@ -1578,7 +1659,14 @@ class StrataEngine:
         each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
         Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
         now = time.monotonic()
-        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
+        waiting = self.wait_lens
+        if BATCH_READ_REQUEUE_MAX_S > 0:
+            waiting = [e for e in waiting if len(e) < 5 or not e[4].is_set()]
+            due = [e for e in waiting if len(e) > 3 and e[3] is not None and
+                   now - e[1] >= BATCH_READ_REQUEUE_MAX_S]
+            if due:
+                return min(due, key=lambda e: e[1])    # stable queue order breaks equal-age ties, not prompt size
+        ordered = [e for e in waiting if len(e) > 2 and e[2]]
         if not ordered:
             return None
         return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
@@ -1622,6 +1710,7 @@ class StrataEngine:
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
+        self._prefetch_hint(prompt, sampling or {}, embeddings)
         ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
@@ -1659,7 +1748,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, left)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
@@ -1709,7 +1798,7 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, left)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1724,7 +1813,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, left) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1736,7 +1825,7 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, left) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -1759,7 +1848,9 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    sl_left = self.slot_left(slot, prompt, left)   # mixed slot contexts: an open-ended one ends there
+                    head = (f"BGENI {slot} {sl_left}{keys} {embeddings}" if embeddings
+                            else f"BGEN {slot} {sl_left}{keys}")
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -1768,7 +1859,7 @@ class StrataEngine:
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
-                    self._ctl_erred = False
+                    self._ctl_erred, self._ctl_window = False, False
                     asked = False
 
                     def ask():        # as give_way above, for the slot this admission reads into
@@ -1820,8 +1911,12 @@ class StrataEngine:
                 holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                if self._ctl_window:                        # homelab: the slot reads the prompt; no token yet
+                    live.update(state="prefilling", generated=len(out))
+                    gen0 = len(out)                         # its first BT is the first token the slot feeds
+                else:
+                    live.update(state="decoding", first_token=time.time(), generated=len(out))
+                    gen0 = len(out) - 1                     # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
                     try:
@@ -1839,6 +1934,8 @@ class StrataEngine:
                         t = int(line.split()[2])
                         out.append(t)
                         live["generated"] = len(out)
+                        if live.get("state") == "prefilling":
+                            live.update(state="decoding", first_token=time.time())
                         if cancel.is_set():
                             if not stop_sent:
                                 self._send(f"BSTOP {slot}")
@@ -1890,7 +1987,7 @@ class StrataEngine:
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
-                    if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
+                    if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
             except EngineDied:
                 pass
@@ -1939,28 +2036,71 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def _held_prefix(self, b: int, prompt: list[int]) -> int:
+        """What of `prompt` slot b's cache serves: the slot's whole held stream (the prompt and what it decoded) when
+        this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of a prompt
+        (the next request of the chat renders the history again, but not the reply it decoded or the assistant
+        header), so a prompt that agrees with the held tokens up to there is that chat's next turn too (#2518,
+        upstream dd08a7d0: another slot was picked, and the request there overwrote the chat whose cache the next one
+        needed)."""
+        h = self.slot_held[b]
+        if not h:
+            return 0
+        if len(h) < len(prompt) and prompt[:len(h)] == h:
+            return len(h)
+        k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
+        return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+
+    def _open_ended(self, prompt: list[int], left: int) -> bool:
+        """The request asked for no max_tokens: its max_new is the room the whole context leaves (prompt_ids)."""
+        return len(prompt) + left + CTX_SLACK >= self.max_context
+
+    def slot_left(self, slot: int, prompt: list[int], left: int) -> int:
+        """The max_new a slot takes: an open-ended request (no max_tokens) ends where its slot's context does, like
+        it ends at the context's end in the main session; a request with max_tokens is only given a slot that holds
+        it (pick_slot), so it is never cut."""
+        ctx = getattr(self, "slot_ctx", None)
+        if not ctx or not self._open_ended(prompt, left):
+            return left
+        return max(1, min(left, ctx[slot] - CTX_SLACK - len(prompt)))
+
+    def _prefetch_hint(self, prompt: list[int], sampling: dict, embeddings) -> bool:
+        """homelab restore prefetch (SLOT_PREFETCH): a long text prompt that no slot holds most of (its conversation was
+        parked, or is new) is sent to the engine as `PREFETCH [cvec=0|1] <ids>` before it waits for the control lines
+        and a slot.  The engine answers nothing (its stdin reader takes the line aside), reads the parked file if it
+        has one, and drops it when no admission takes it.  True when sent."""
+        if not SLOT_PREFETCH or embeddings or len(prompt) < SLOT_PREFETCH_MIN_TOKENS or not getattr(self, "batch", 0):
+            return False
+        with self.slot_cv:
+            held = max((self._held_prefix(b, prompt) for b in range(self.batch)), default=0)
+        if held * 2 >= len(prompt):        # its own slot (or one with most of it) serves it: nothing to read
+            return False
+        try:
+            self._send(f"PREFETCH{StrataEngine.projection_key(sampling)} {','.join(str(int(t)) for t in prompt)}")
+        except EngineDied:
+            return False                   # the request finds out on its own
+        self.prefetch_hints = getattr(self, "prefetch_hints", 0) + 1
+        return True
+
+    def pick_slot(self, prompt: list[int], left: int = 0) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        conversations other slots hold stay for their next turns.  None: no fitting slot is free.  With mixed slot
+        contexts a big slot is preferred only for a conversation that needs it or already lives there.  If no such
+        slot or small slot is free, use any fitting idle slot.  This never preempts a busy slot: a later long request
+        waits until a fitting slot is free."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
+        ctx = getattr(self, "slot_ctx", None)
+        if ctx and len(set(ctx)) > 1:
+            need = len(prompt) + CTX_SLACK + (min(left, SLOT_ROOM_MIN) if self._open_ended(prompt, left) else left)
+            small = min(ctx)
+            fits = [b for b in free if ctx[b] >= need]
+            free = [b for b in fits if ctx[b] == small or need > small or self._held_prefix(b, prompt) > 0] or fits
         if not free:
             return None
 
         def held_prefix(b):
-            # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
-            # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
-            # a prompt (the next request of the chat renders the history again, but not the reply it decoded or the
-            # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
-            # too (#2518, upstream dd08a7d0: another slot was picked, and the request there overwrote the chat whose
-            # cache the next one needed)
-            h = self.slot_held[b]
-            if not h:
-                return 0
-            if len(h) < len(prompt) and prompt[:len(h)] == h:
-                return len(h)
-            k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
-            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+            return self._held_prefix(b, prompt)
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
@@ -2553,7 +2693,7 @@ class Vision:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im: Image.Image = Image.open(io.BytesIO(data))
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
@@ -4323,8 +4463,18 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        generate = self.engine.generate
+                        worker = getattr(generate, "__self__", None)
+                        route = None
+                        if trace is not None:
+                            chosen = worker.route_identity() if isinstance(worker, StrataEngine) else None
+                            with self.status_lock:
+                                route = trace.setdefault("engine_route", {"worker": chosen, "calls": 0,
+                                                                          "tokens": 0, "stable": True})
+                                route["calls"] += 1
+                                route["stable"] &= chosen is not None and route["worker"] == chosen
+                        gen = generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                            else generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -4342,6 +4492,8 @@ class Service:
                                     yield "ping", None
                                     continue
                                 n += 1
+                                if route is not None:
+                                    route["tokens"] += 1     # no heartbeat or wrapper-injected continuation tokens
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
@@ -4429,6 +4581,10 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
+                            if route is not None:
+                                after_route = worker.route_identity() if isinstance(worker, StrataEngine) else None
+                                with self.status_lock:
+                                    route["stable"] &= after_route is not None and route["worker"] == after_route
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
@@ -5648,7 +5804,9 @@ def make_handler(svc: Service):
                     if getattr(svc.engine, "batch", 0) and hasattr(svc.engine, "slots_view"):
                         # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
                         n_ctx = svc.reported_ctx()
-                        slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
+                        ctx = getattr(svc.engine, "slot_ctx", None) or []   # mixed slot contexts: each its own
+                        slots = [{"id": s["slot"], "n_ctx": ctx[s["slot"]] if s["slot"] < len(ctx) else n_ctx,
+                                  "is_processing": s["state"] != "idle",
                                   "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
                                  for s in svc.engine.slots_view()]
                     else:

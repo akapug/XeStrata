@@ -29,6 +29,7 @@ args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args        # #997: the first window over two slots fails
+WINDOW = "--window" in args           # homelab window-row prefill: BGEN answers BADM 2, the first token a BT
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -129,6 +130,12 @@ while True:
         if slot is not None and b"NFSLOT" in pb:
             nf_slots.add(slot)
         toks = reply(ids)
+        if WINDOW and slot is not None:   # the slot reads the prompt in its windows: nothing generated here
+            print(f"DONE 0 {len(ids)} 0.0 0.0 length 0 0 {reused(ids)} 0 0 0 0 0.0 {len(ids) - reused(ids)} 0",
+                  flush=True)
+            active[slot] = [toks, max_new, 0]
+            print(f"BADM {slot} 2", flush=True)
+            continue
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
@@ -195,6 +202,14 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": True}, []), [])
         self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
 
+    def test_research_parallel_operand_is_not_capped_by_warning_threshold(self):
+        self.assertEqual(parallel_args({"parallel": 32}, []), ["--batch", "32"])
+        for flag in ("--batch", "--slots"):
+            args = [flag, "32"]
+            with self.subTest(flag=flag):
+                self.assertEqual(parallel_args({"parallel": 2}, args), [])
+                self.assertEqual(engine_args({"args": args}), args)
+
     def test_parallel_above_the_window_says_so_unless_batch_mtp(self):
         import contextlib
         import io
@@ -252,6 +267,45 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
 
+    def test_uniform_contexts_do_not_enter_mixed_slot_fallback_policy(self):
+        e = self.engine(3)
+        e.slot_held = [[1, 2, 3], [], [1, 2, 3, 4, 5]]
+        e.slot_used = [5.0, 0.0, 9.0]
+        cases = [([1, 2, 3, 4, 5, 6], [False] * 3, 2),
+                 ([7, 8], [False] * 3, 1),
+                 ([7, 8], [False, True, False], 0),
+                 ([7, 8], [True] * 3, None)]
+        for prompt, busy, expected in cases:
+            e.slot_busy = busy
+            for contexts in (None, [200] * 3):
+                e.slot_ctx = contexts
+                with self.subTest(prompt=prompt, busy=busy, contexts=contexts):
+                    self.assertEqual(e.pick_slot(prompt, 10), expected)
+
+    def test_retained_mixed_context_idle_big_slots_need_canonical_fallback(self):
+        import inspect
+        import textwrap
+
+        # Retained mixed-context operands: two big slots idle, every small slot busy, no matching prefix.
+        e = self.engine(32)
+        e.max_context = 262144
+        e.slot_ctx = [262144] * 2 + [131072] * 30
+        e.slot_busy = [False] * 2 + [True] * 30
+        prompt = [1, 2, 3]
+        before = list(e.slot_busy)
+        self.assertEqual(e.pick_slot(prompt, 10), 0)
+        self.assertEqual(e.slot_busy, before)
+        e.slot_busy[0] = True
+        self.assertEqual(e.pick_slot(prompt, 10), 1)
+        # Mutate only our canonical method's fallback, never execute retained deployment DATA.
+        source = textwrap.dedent(inspect.getsource(StrataEngine.pick_slot))
+        fallback = "] or fits"
+        self.assertEqual(source.count(fallback), 1)
+        scope = dict(StrataEngine.pick_slot.__globals__)
+        exec(compile(source.replace(fallback, "]"), "<picker-without-fallback>", "exec"), scope)
+        self.assertIsNone(scope["pick_slot"](e, prompt, 10))
+        self.assertEqual(e.slot_busy, [True, False] + [True] * 30)
+
     def test_a_rewritten_next_turn_goes_to_the_slot_of_its_chat(self):
         # #2518: two chats in two slots; each next turn renders the history again but not the reply it decoded or
         # the assistant header, so the held stream (prompt + reply) is no start of it.  The engine's turn checkpoint
@@ -295,6 +349,113 @@ class PickSlot(unittest.TestCase):
         e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
         e.slot_held[1] = [1, 2, 3]
         self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
+
+    def test_mixed_slot_contexts_prefer_small_slots_and_keep_long_conversation_affinity(self):
+        # --slot-context 100 --big-slots 1 (max context 200): slot 0 holds 200 cells, slots 1-2 hold 100.  A short
+        # request prefers a small slot, but can use an idle big one when the small slots are busy.  A request that
+        # needs more than 100 takes only the big one (else waits); its next turn keeps the held prefix.
+        e = self.engine(3)
+        e.max_context = 200
+        e.slot_ctx = [200, 100, 100]
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 1)              # small: the small slots, never the big one
+        e.slot_busy[1] = e.slot_busy[2] = True
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)              # small slots full: borrow the idle big one
+        e.slot_busy[1] = e.slot_busy[2] = False
+        long = list(range(1000, 1080))
+        self.assertEqual(e.pick_slot(long, 40), 0)                  # 80 + 40 + 8 > 100: only the big slot fits
+        e.slot_busy[0] = True
+        self.assertIsNone(e.pick_slot(long, 40))                    # big slot busy: it waits for it
+        e.slot_busy[0] = False
+        e.slot_held[0] = long + [7, 8]                              # the main agent lives in the big slot now
+        self.assertEqual(e.pick_slot(long + [7, 8, 9], 5), 0)        # its next turn goes back there even when short
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 1)              # a new short chat still prefers a small slot
+        # open-ended (no max_tokens: max_new is the whole context's room) takes a small slot and ends where it does,
+        # as long as the slot leaves SLOT_ROOM_MIN to answer in
+        e.slot_held[0] = []
+
+        def room(p):
+            return 200 - 8 - len(p)
+
+        with mock.patch("serve.server.SLOT_ROOM_MIN", 16):
+            self.assertEqual(e.pick_slot([1, 2, 3], room([1, 2, 3])), 1)
+            self.assertEqual(e.slot_left(1, [1, 2, 3], room([1, 2, 3])), 100 - 8 - 3)
+            self.assertEqual(e.slot_left(0, [1, 2, 3], room([1, 2, 3])), room([1, 2, 3]))
+            self.assertEqual(e.slot_left(1, [1, 2, 3], 10), 10)            # max_tokens given: never cut
+            self.assertEqual(e.pick_slot(long, room(long)), 0)               # 80 + 16 + 8 > 100: the big slot
+        e.slot_ctx = [200, 200, 200]                                # one context: as before
+        e.slot_busy[1] = e.slot_busy[2] = True
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)
+
+    def test_short_request_borrows_only_the_idle_big_slot_without_preempting(self):
+        # The stranded mixed-context shape: one big slot busy, one idle, every small slot busy.
+        e = self.engine(4)
+        e.max_context = 200
+        e.slot_ctx = [200, 200, 100, 100]
+        e.slot_busy = [True, False, True, True]
+        before = list(e.slot_busy)
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 1)
+        self.assertEqual(e.slot_busy, before)                       # the caller, not the picker, reserves it
+        e.slot_busy[1] = True                                     # the short request now owns the borrowed slot
+        long = list(range(1000, 1080))
+        self.assertIsNone(e.pick_slot(long, 40))                   # no eviction of either running big request
+        e.slot_busy[2] = False
+        self.assertIsNone(e.pick_slot(long, 40))                   # a free small slot cannot hold its budget
+        self.assertEqual(e.slot_left(1, long, 40), 40)              # an explicit budget is not shortened
+        e.slot_busy[1] = False                                    # the borrower has finished
+        self.assertEqual(e.pick_slot(long, 40), 1)
+        e.slot_busy = [False, True, True, True]                    # not an assumption that big slot 1 is idle
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)
+        e.slot_busy[0] = True
+        self.assertIsNone(e.pick_slot([1, 2, 3], 10))
+
+    def test_idle_big_slot_fallback_keeps_empty_then_lru_order(self):
+        e = self.engine(4)
+        e.max_context = 200
+        e.slot_ctx = [200, 200, 100, 100]
+        e.slot_busy = [False, False, True, True]
+        e.slot_held[0] = [8, 9]
+        e.slot_used = [0.0, 10.0, 0.0, 0.0]
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 1)              # empty before an older cached slot
+        e.slot_held[1] = [6, 7]
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)              # both cached: least recently used
+        e.slot_used[0] = 20.0
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 1)
+        e.slot_held[0] = [1, 2]
+        e.slot_busy[2] = False
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)              # normal held-prefix affinity still wins
+        e.slot_held[0] = []
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 2)              # otherwise keep the free small preference
+
+    def test_idle_big_slot_fallback_keeps_group_balance_and_hole_order(self):
+        e = self.engine(6)
+        e.max_context = 200
+        e.slot_ctx = [200, 200, 200, 200, 100, 100]
+        e.slot_groups = 2
+        e.slot_group = [0, 0, 0, 1, 1, 1]
+        e.slot_busy = [False, True, False, False, True, True]
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)              # less busy group before group 1
+        e.slot_order = [2, 0, 1, 3, 4, 5]
+        e.slot_gs = 3
+        self.assertEqual(e.pick_slot([1, 2, 3], 10), 0)              # hole before the earlier idle tail
+
+    def test_idle_big_slot_fallback_never_changes_fit_or_explicit_budget(self):
+        e = self.engine(4)
+        e.max_context = 200
+        e.slot_ctx = [200, 150, 100, 100]
+        e.slot_busy = [True, False, True, True]
+        prompt = list(range(80))
+        self.assertIsNone(e.pick_slot(prompt, 70))                  # 80 + 70 + slack exceeds every free slot
+        e.slot_busy[0] = False
+        self.assertEqual(e.pick_slot(prompt, 70), 0)
+        self.assertEqual(e.slot_left(0, prompt, 70), 70)
+        e.slot_busy = [True, True, False, False]
+        self.assertIsNone(e.pick_slot(prompt, 40))                  # never shrink the budget to fit a small slot
+        e.slot_busy = [False] * 4
+        self.assertIsNone(e.pick_slot(list(range(201)), 0))         # no fitting slot even when every slot is idle
+        e.slot_busy[2] = e.slot_busy[3] = True
+        with mock.patch("serve.server.SLOT_ROOM_MIN", 16):
+            self.assertEqual(e.pick_slot([1, 2, 3], 189), 0)        # open-ended fallback retains its slot's room
+            self.assertEqual(e.slot_left(0, [1, 2, 3], 189), 189)
 
     def test_slots_view(self):
         e = self.engine(2)
@@ -611,6 +772,31 @@ class ParallelService(unittest.TestCase):
         slot = self.engine.slot_held.index(mine[0])
         self.assertEqual(self.engine.pick_slot(mine[0] + [10, 11]), slot)
         self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_window_prefill_admission_streams_its_first_token_as_a_bt(self):
+        """homelab: BADM <slot> 2 - the slot reads the prompt in its windows, so the admission says DONE with nothing
+        generated and every token (the first one too) comes as a BT; the reply, the totals and what the slot holds
+        are as for BADM 1."""
+        self.start(2, more=("--window",))
+        r1 = {}
+        th = threading.Thread(target=lambda: r1.setdefault("x", self.chat("blocker LONGREPLY", max_tokens=200)))
+        th.start()
+        time.sleep(0.05)
+        first = self.chat("conversation W, first turn")
+        th.join(30)
+        self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(r1["x"]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        deadline = time.time() + 10
+        while len([h for h in self.engine.slot_held if h]) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        reply = list(b"ok, done.") + [257]
+        mine = [h for h in self.engine.slot_held
+                if h and h[-len(reply) + 1:] == reply[:-1] and bytes(x for x in h if x < 256).find(b"conversation W") >= 0]
+        self.assertEqual(len(mine), 1, self.engine.slot_held)
+        with self.svc.status_lock:
+            self.assertEqual(sorted(r["output_tokens"] for r in self.svc.history),
+                             sorted([len(reply), len(list(b"ok, " + b"la " * 15 + b"done.")) + 1]))
+            self.assertEqual(self.svc.live_reqs, {})
 
     def test_a_failed_window_names_its_error(self):
         # #997 #890: a batch window fails while every request reads its own slot's lines, so no request reads the

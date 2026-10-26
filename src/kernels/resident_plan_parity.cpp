@@ -36,7 +36,7 @@ int main() {
     uint8_t* const cache_base = reinterpret_cast<uint8_t*>(uintptr_t(0x40000000));   // never dereferenced
     void* st = P::stream();
 
-    auto* d_ids = dalloc<int32_t>(128);
+    auto* d_ids = dalloc<int32_t>((size_t) capx);
     auto* d_res = dalloc<int32_t>(NE);
     auto* d_off = dalloc<unsigned long long>(1024);
     auto* d_plan = dalloc<int32_t>(plan_words);
@@ -52,7 +52,7 @@ int main() {
     const uint32_t zero = 0;
 
     int cases = 0, bad = 0;
-    for (int n = 1; n <= 80; ++n) {
+    for (int n = 1; n <= capx; ++n) {
         for (int variant = 0; variant < 4; ++variant) {
             const int pool = variant == 0 ? 3 : (variant == 1 ? 12 : (variant == 2 ? 40 : 512));
             std::vector<int32_t> ids(n);

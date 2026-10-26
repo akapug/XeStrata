@@ -244,7 +244,7 @@ st_begin(layer, 8, stream);
     }
     st_end(layer, 8, stream);
 // ---- 2. qkv = wqkv @ x, with the activation THIS layer's `attn_qkv` asks for
-st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_0, b.x_q8k, b.qkv, g.n_embd, C,                        v.name("attn_qkv.weight"), stream, err, mixed)) return false;    st_end(layer, 9, stream);
+st_begin(layer, 9, stream);    { MmvqRoleScope role(MmvqRole::qkv); if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_0, b.x_q8k, b.qkv, g.n_embd, C,                        v.name("attn_qkv.weight"), stream, err, mixed)) return false; }    st_end(layer, 9, stream);
 // ---- 3. conv, then SiLU on the WHOLE conv output - before the q|k|v split, which is what
 //         `ref/gdn.py` L262 says and what makes the split a reshape rather than a copy.
 st_begin(layer, 10, stream);
@@ -336,7 +336,7 @@ st_begin(layer, 15, stream);
     if (!w_out->native_data) {
         quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
         quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
-    }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;    st_end(layer, 15, stream);    return true;}
+    }    { MmvqRoleScope role(MmvqRole::ssm_out); if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false; }    st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
 uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2,
 // x_bf16
@@ -492,6 +492,24 @@ namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
+int64_t g_kv_host_copies = 0;   // the host copies made (host_pin_report's note)
+// Pinned RAM is never reclaimed: a KV copy that would leave the host under STRATA_KV_HOST_RESERVE_GIB (16) of
+// available RAM is refused, so too many slots fail the load instead of stalling the box in reclaim (odie 2026-10-23:
+// --batch 32 at 262144 cells pinned past its 128 GB and sshd starved).
+bool kv_host_fits(uint64_t bytes) {
+    static const uint64_t reserve = [] {
+        const char* v = std::getenv("STRATA_KV_HOST_RESERVE_GIB");
+        return (uint64_t) (v != nullptr ? std::strtoull(v, nullptr, 10) : 16) << 30;
+    }();
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return true;   // no meminfo: the allocator's own failure stands
+    char key[64];
+    unsigned long long kib = 0;
+    bool found = false;
+    while (!found && std::fscanf(f, "%63s %llu%*[^\n]", key, &kib) == 2) found = std::strcmp(key, "MemAvailable:") == 0;
+    std::fclose(f);
+    return !found || bytes + reserve <= (uint64_t) kib << 10;
+}
 
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
@@ -645,7 +663,15 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
-int64_t qsa_kv_resident_min() { return 20480; }
+// The smallest VRAM ring a streamed main layer gets.  The resolve kernel needs at least one work-group of page slots
+// (kv_stream.cpp), so a value below that throws at the first stream; the default keeps a 20K-cell working set.
+int64_t qsa_kv_resident_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_KV_RESIDENT_MIN");
+        return e != nullptr && e[0] != '\0' ? std::max<int64_t>(std::atoll(e), 1) : (int64_t) 20480;
+    }();
+    return v;
+}
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
@@ -778,8 +804,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (!strata::gpu::alloc_host((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t)) ||
-        !strata::gpu::alloc_host((void**) &st.host_pos, (size_t) s.n_head * 4)) {
+    if (!strata::gpu::alloc_host((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t), "qsa-staging") ||
+        !strata::gpu::alloc_host((void**) &st.host_pos, (size_t) s.n_head * 4, "qsa-staging")) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     st.host_step[strata::kernels::kStepCount] = 0;
@@ -790,7 +816,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (!strata::gpu::alloc_host((void**) &h, bytes) ||
+        if (!kv_host_fits(bytes)) {
+            std::fprintf(stderr, "strata: KV streaming: pinning %.2f GiB more for a layer's KV copy would leave the host "
+                                 "under STRATA_KV_HOST_RESERVE_GIB of available RAM (%.2f GiB pinned so far) - fewer "
+                                 "batch slots or a lower context\n",
+                         (double) bytes / 1073741824.0, (double) g_kv_host_bytes / 1073741824.0);
+            return 0;
+        }
+        if (!strata::gpu::alloc_host((void**) &h, bytes, "kv-stream") ||
             !strata::gpu::device_pointer((void**) &d, h)) {
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident\n",
@@ -799,6 +832,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         g_kv_host_bytes += bytes;
+        ++g_kv_host_copies;
+        strata::gpu::host_pin_detail("kv-stream", std::to_string(g_kv_host_copies) + " QSA-layer copies of every cell's "
+                                     "K/V (the latest " + std::to_string((long long) pages * s.page_size) + " cells; VRAM "
+                                     "keeps a ring): --slot-context or a lower --max-context shrinks them");
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);

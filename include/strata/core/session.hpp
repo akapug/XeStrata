@@ -94,11 +94,17 @@ struct SessionState {
 /// would satisfy every test here and fail that one.
 /// [layer_lo, layer_hi) carves only that range's per-layer state (a layer split's stage); the default full range is
 /// the whole-model carve.  Pure arithmetic: safe to call for a candidate range before anything is allocated.
+/// What session_bytes adds up, one "name MiB" item each (the batch slots' VRAM line says where it goes).
+std::string session_bytes_report(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
+                                 int64_t layer_hi = -1, bool own_rope = true);
+/// `own_rope` false: the session borrows another's RoPE table (session_init's `rope_from`) and carves none.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
+                       int64_t layer_hi = -1, bool own_rope = true);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
+/// `rope_from`: a live session on the same device, at least `max_cells` long, whose RoPE table this one reads
+/// (the batch slots borrow the main session's: one table per device instead of one per slot).
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const SessionState* rope_from = nullptr);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 /// Unpublish this session's RoPE table before its arena is freed.

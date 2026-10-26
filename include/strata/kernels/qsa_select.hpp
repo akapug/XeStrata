@@ -37,6 +37,21 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 
+/// qsa_block_scores (nq = 1 a row) for a batch window's rows, each over its own slot's indexer keys (STRATA_BATCH_QSA_ROWS):
+/// row r's pooled keys pooled[r], its dead key dead[r], query q_idx + r * heads * dim, step steps + r * kStepCount,
+/// scores + r * max_blocks.  Row r's arithmetic is the one-row call's, so the same bits.  For a graph: the grid is
+/// max_blocks.
+struct QsaScoreSlots {
+    const float* pooled[kQsaSlotsMax] = {};
+    const float* dead[kQsaSlotsMax] = {};
+};
+void qsa_block_scores_slots(const QsaScoreSlots& tab, const float* q_idx, const int32_t* steps, int64_t nq,
+                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+/// STRATA_QSA_SCORES_STRIDE (default off, homelab): qsa_block_scores_slots on a fixed grid of ~1,024 work-groups whose
+/// sub-groups walk each row's n_bid + 1 blocks, instead of max_blocks / 8 work-groups a row (most of them past n_bid);
+/// the same scores.  For tests, before graph capture: 1 on, 0 off, -1 the setting again.
+void qsa_block_scores_set_stride(int on);
+
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,

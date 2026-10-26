@@ -30,9 +30,12 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/batch_outbound.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <map>
@@ -295,10 +298,58 @@ public:
     // stage k+1 runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share one;
     // a stage on another GPU gets its group's rows copied over when the window is done.
     bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// The same window over an explicit row list (homelab window-row prefill, STRATA_BATCH_PREFILL): row t is slot
+    /// rows[t], a slot's rows contiguous at consecutive positions (its prompt tokens, as a --batch-mtp slot's token and
+    /// proposal), hand-off rows [hbase, hbase + S).  `keep` (indexed by slot, null: every row) is how many of each slot's
+    /// rows the commit behind the window keeps, 1..its rows: the rest pad a short run and are not committed.  0 (a slot
+    /// of one row, pad_rows_harmless): a pad row, attended at position 0, its K/V into cell `pos`, nothing else kept.
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, const int* keep,
+                           std::string& err);
+    /// The rows of this stage's hand-off buffers (homelab: groups x the window capacity for window-row prefill, whose
+    /// groups take more rows than slots).  0: max(the window capacity, the slots), as before.  Before init_slots and
+    /// enable_batch_outbound.
+    void set_handoff_rows(int rows) { handoff_rows_ = rows; }
+    /// Whether a pad row (batch_launch_rows' keep 0 for a slot of one row: an idle slot in a group's window) leaves
+    /// that slot's conversation as it was: its K/V goes to the cell at `pos` (the caller passes the slot's history
+    /// length, past it), and its indexer, GDN conv history and state, and PLE history are not written.  False where
+    /// the window's own GDN commit cannot skip a row (STRATA_BATCH_SELF_COMMIT without STRATA_BATCH_GDN_SLOTS): the
+    /// caller then pads with position 0 and keep 1, which writes the slot (the old behaviour).
+    static bool pad_rows_harmless();
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
-    /// -1 = an error (err).  Serves every layer that has rung so far.
+    /// 2 = compute is done but this group's outbound copy still needs batch_outbound_poll; -1 = an error (err).
+    /// Serves every layer that has rung so far.  Only the pipelined scheduler opts into the extra result.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
+    /// STRATA_BATCH_OUTBOUND_ASYNC (default off): enable before any batch graph capture, after init_slots.
+    /// Only the pipelined scheduler calls this.  Other paths keep their synchronous hand-off contract.
+    bool enable_batch_outbound(std::string& err);
+    /// 0 = copy pending, 1 = copy completed AND receiver rows acknowledged, -1 = failed.  No success on submit.
+    int batch_outbound_poll(int base, std::string& err);
     bool batch_busy() const { return b_running_; }
+    /// STRATA_BATCH_TIMELINE=<n> (homelab K2, default 0 = off): the pipelined loop reports every n group-steps where a
+    /// stage window's time goes (host staging, graph submit, device span, the device's idle gap between windows, the
+    /// host noticing the end, the wait for the other stage).  Per window: host steady-clock ns; device ns from timing
+    /// tags right before the window's graph and right after its last graph (the device timer: compare within a device).
+    struct BatchTimes {
+        int64_t h_begin = 0, h_submit = 0, h_ret = 0, h_notice = 0;
+        uint64_t d_start = 0, d_end = 0;
+        bool dev = false;
+        size_t nodes = 0;
+        int rows = 0;
+        // With STRATA_VERIFY_PROFILE as well: the out hand-off's two in-graph stamps.  out_ms is an estimate from
+        // this window's calibrated clock rate, not profiling-tag ns; -1 means UNKNOWN.  No clock: no raw ticks either.
+        uint64_t out_ticks = 0;
+        double out_ms = -1;
+        const char* out_clock = "none";
+        const char* out_scope = "mapped-host";   ///< async outbound: these graph stamps cover device packing, not D2H
+        void set_handoff(uint64_t start, uint64_t out_start, uint64_t out_end, uint64_t end, double window_ms);
+    };
+    static int batch_timeline();
+    /// STRATA_BATCH_RAW_WINDOWS=1: one raw record per completed stage window; independent of interval aggregates.
+    static bool batch_raw_windows();
+    const BatchTimes& batch_times() const { return bt_last_; }
+    /// host steady-clock ns minus this device's timer ns, from timing tags on an idle queue of the device (the round
+    /// with the shortest host round trip, its midpoint); false where the device has no timing tags
+    bool device_clock_offset(double* host_minus_dev_ns);
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
@@ -354,12 +405,17 @@ public:
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// Whether the window reads the PCIe share beside its VRAM hits (STRATA_FETCH_BRANCH), for the split's estimate.
     bool fetch_branch() const { return fetch_branch_; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// homelab: this verifier's kernels can never read a PCIe share (a layer split stage whose GPU cannot read CUDA0's
+    /// host memory: its pool's share is 0 for the process).  With STRATA_SKIP_NO_PCIE_SHARE=1 (default off) its
+    /// windows leave out the PCIe share's flag wait, fetch and grouped launch, which then had no group.  Before the
+    /// first run (the captured graphs keep it).
+    void set_no_pcie_share(bool on) { no_pcie_share_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
-    /// STRATA_VERIFY_PROFILE=1 - GPU stage counts since the last call (millions of device-clock ticks per
-    /// window), as one line; empty when off, unsupported, or no windows have been profiled.
+    /// STRATA_VERIFY_PROFILE=1 - GPU stage times since the last call (ms per window at the windows' measured clock
+    /// rate; millions of device-clock ticks per window where no rate was measured), as one line; empty when off,
+    /// unsupported, or no windows have been profiled.
     std::string profile_report();
 
 private:
@@ -386,41 +442,56 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kVerifyMaxT] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)
+    /// Window and commit own the SAME full key, including residency; eviction retires both.
+    /// key: batch_key(rows, S, hand-off base, residency) - the whole row layout (--batch-mtp repeats a slot over its rows)
     std::map<std::vector<int>, strata::gpu::Graph*> exec_bm_, commit_bm_;
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, with a graph limit)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph; N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    static std::vector<int> batch_key(const int* rows, int S, int hbase) {
+    int last_rows_[strata::kernels::kVerifyMaxT] = {};                ///< the slots of the last batch window's rows
+    bool self_b_ = false;                  ///< STRATA_BATCH_SELF_COMMIT: the last batch window kept its rows itself
+    bool res_b_ = false;                   ///< STRATA_BATCH_RESIDENT_GRAPH: the last batch window rang no layer
+    static std::vector<int> batch_key(const int* rows, int S, int hbase, bool res = false) {
         std::vector<int> k;
         k.reserve((size_t) S + 1);
-        k.push_back(hbase);
+        k.push_back(res ? -1 - hbase : hbase);   // the all-resident graph of a layout is another graph
         for (int t = 0; t < S; ++t) k.push_back(rows[t]);
         return k;
     }
     int row_base_ = 0;                     ///< a batch window's first hand-off row (its slot group's base)
     // batch_launch / batch_poll
     bool b_running_ = false;
+    BatchOutbound outbound_;   ///< a group's packed device rows survive the next group's compute scratch reuse
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kVerifyMaxT] = {};
+    uint32_t ple_late_rows_[strata::kernels::kVerifyMaxT * 16] = {};   ///< STRATA_BATCH_PLE_LATE: the rows to read
+    int ple_late_n_ = 0;                                                ///< after the launch (0: none pending)
+    bool ple_late_publish(std::string& err);
+    BatchTimes bt_cur_, bt_last_;                          ///< STRATA_BATCH_TIMELINE: the window in flight, the last done
+    strata::gpu::Event* tl_ev_[3] = {nullptr, nullptr, nullptr};   ///< its tags (start, end), the clock probe's
+    strata::gpu::Stream tl_q_ = nullptr;                   ///< an idle queue of this device for the clock probe
     /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
-    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err,
+                     const int* keep = nullptr);
+    int handoff_rows_ = 0;                 ///< set_handoff_rows
+    size_t handoff_capacity() const {
+        return std::max({(size_t) max_t_, slots_.size(), (size_t) std::max(handoff_rows_, 0)});
+    }
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
-    bool capture_batch(const int* rows, int S, int hbase, std::string& err);
-    bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
+    int64_t last_pos_b_[strata::kernels::kVerifyMaxT] = {};
+    bool capture_batch(const int* rows, int S, int hbase, std::string& err, bool res = false);
+    bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err, bool res = false);
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
-    strata::gpu::Graph* exec_res_[9] = {};
+    strata::gpu::Graph* exec_res_[strata::kernels::kVerifyMaxT + 1] = {};
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
@@ -435,6 +506,12 @@ private:
                                                      // at slot 32 = the next layer's slot 0: upstream e5b47dd)
     bool prof_on_ = false;
     void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    // The window's clock rate: around each profiled window's graph, a profiling tag (nanoseconds) and a stamp (ticks)
+    // at its start and at its end (stamp slots n_layers * kProfPer + 2 and + 3); prof_ns_ / prof_ticks_ sum them.
+    void prof_mark(int end);
+    strata::gpu::Event* prof_ev_[2] = {nullptr, nullptr};
+    bool prof_tag_ok_[2] = {false, false};   ///< this replay's calibration tags, never a previous successful record
+    double prof_ns_ = 0, prof_ticks_ = 0;
     // pipelined windows (pl_launch ...)
     strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
@@ -459,20 +536,21 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kVerifyMaxT] = {};
     int64_t n_vocab_ = 0;
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
     bool df_branch_ = false;
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
-    strata::gpu::Graph* exec_[9] = {};
+    bool no_pcie_share_ = false;   ///< set_no_pcie_share
+    strata::gpu::Graph* exec_[strata::kernels::kVerifyMaxT + 1] = {};
     strata::gpu::Graph* commit_exec_ = nullptr;
     // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as
     // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
     // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.
     bool segmented_ = false;
-    std::vector<strata::gpu::Graph*> segs_[9];
+    std::vector<strata::gpu::Graph*> segs_[strata::kernels::kVerifyMaxT + 1];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
     // mapped staging (host pointer, device alias)
@@ -480,6 +558,9 @@ private:
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
     int32_t* h_pos_ = nullptr;   int32_t* m_pos_ = nullptr;     // T * n_head
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
+    // a batch window's per-row writes (stage_batch): [0, T) the K/V append cell, [T, 2T) the indexer append position
+    // (-1: none), [2T, 3T) whether the row's slot keeps its GDN conv history, state and PLE history (0: a pad row)
+    int32_t* h_rowx_ = nullptr; int32_t* m_rowx_ = nullptr;
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
@@ -510,15 +591,28 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[strata::kernels::kVerifyMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
     void* arena_ = nullptr;
-    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr, *rowx_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+    // STRATA_BATCH_DENSE_MMQ_MIN: a batch window's dense projections on the int8 matrix engines (iq_mmq, as one expert
+    // of n rows): its activations, the {0, n} bounds of every n, and the identity row map
+    uint8_t* dq_ = nullptr;
+    uint16_t* bx_ = nullptr;   // opt-in BF16x2 dense products: high + residual activations
+    int32_t *dbounds_ = nullptr, *dids_ = nullptr;
+    // STRATA_BATCH_HC_MMQ_MIN: a batch window's hc reads with their products on the matrix engines (hc_mmq.hpp): the
+    // products' inputs and output, the {0, n} bounds of every n and the identity row map, and per layer which of its
+    // two reads may (bit h: read h's weights passed the shape and alignment checks at init on a device with the engine)
+    uint16_t *hxb_ = nullptr, *hlb_ = nullptr;
+    float* hup_ = nullptr;
+    uint8_t* hxq_ = nullptr;
+    int32_t *hbounds_ = nullptr, *hids_ = nullptr;
+    std::vector<uint8_t> hc_mmq_layer_;
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;

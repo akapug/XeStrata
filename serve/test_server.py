@@ -3746,6 +3746,32 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
 
+    def test_wrapup_environment_default_empty_and_custom_reach_the_continuation(self):
+        import runpy
+
+        default = "I have thought about this long enough; time to give my answer."
+        for value in (None, "", "Now give the checked result."):
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                os.environ.pop("STRATA_REASONING_WRAP_UP", None)
+                if value is not None:
+                    os.environ["STRATA_REASONING_WRAP_UP"] = value
+                # Evaluate our canonical module afresh, not retained deployment data or a running engine.
+                fresh = runpy.run_path(str(ROOT / "serve/server.py"), run_name="wrapup_setting_fixture")
+                wrap = "\n\n" + (value or default) + "\n</think>\n\n"
+                self.assertEqual(fresh["REASONING_WRAP_UP"], wrap)
+                self.engine.prompts.clear()
+                with mock.patch("serve.server.REASONING_WRAP_UP", wrap):
+                    code, response = self.openai(reasoning_budget_tokens=20)
+                self.assertEqual(code, 200)
+                message = response["choices"][0]["message"]
+                self.assertEqual(message["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap.split("</think>")[0])
+                self.assertEqual(message["content"], ThinkingEngine.ANSWER)
+                first, second = self.engine.prompts
+                extra = self.tok.encode(wrap, parse_special=True)
+                self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+                self.assertEqual(response["usage"]["completion_tokens"],
+                                 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
+
     def test_a_stop_string_is_found_in_the_answer_after_the_wrap_up(self):
         """#454: the continuation after the thinking budget is cut at a stop string too."""
         code, b = self.openai(reasoning_budget_tokens=20, stop=["answer is"])

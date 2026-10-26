@@ -91,6 +91,7 @@
 #pragma once
 
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/kernels/window_capacity.hpp"
 
 #include <cstdint>
 
@@ -372,5 +373,30 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
 /// kcur / vcur + t * cur_stride floats (the FP16 pools only, no host copy).
 void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step, int step_stride,
                      const float* kcur, const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream);
+
+/// BATCH WINDOWS, ONE LAUNCH FOR EVERY ROW (STRATA_BATCH_QSA_ROWS): a batch window's rows each read and write their own
+/// slot's QSA state, so the `_slots` kernels take a table with one entry a row instead of one state.  The tables go into
+/// the kernel by value: a captured batch graph bakes them, as it bakes the per-row launches' pointers (a graph is keyed
+/// by its rows' slots, and a slot's buffers keep their addresses for its life).
+inline constexpr int kQsaSlotsMax = kVerifyMaxT;   ///< a batch window's rows
+
+/// Row j's K/V destinations (pool memory per format: fp16 pools, int8 codes + scales, q4_0 blocks) and page table.
+struct KvAppendSlots {
+    void* k[kQsaSlotsMax] = {};
+    void* v[kQsaSlotsMax] = {};
+    uint16_t* k_scale[kQsaSlotsMax] = {};   ///< int8 only
+    uint16_t* v_scale[kQsaSlotsMax] = {};
+    const int32_t* page_table[kQsaSlotsMax] = {};
+    /// KV streaming: row j's host copy (kv_stream.hpp's KvHostPools in the same per-format roles as k / v / k_scale /
+    /// v_scale), written always, as the one-row appends write theirs; null: no host copy (a fully resident state).
+    void* host_k[kQsaSlotsMax] = {};
+    void* host_v[kQsaSlotsMax] = {};
+    uint16_t* host_k_scale[kQsaSlotsMax] = {};
+    uint16_t* host_v_scale[kQsaSlotsMax] = {};
+};
+/// kv_append_steps over n_tok rows, row j into its own table entry: its VRAM page if the block is resident, and its
+/// host copy when it has one.  Row j's step at step + j * step_stride, its K and V at kcur / vcur + j * cur_stride floats.
+void kv_append_slots(const KvAppendSlots& tab, const int32_t* step, int step_stride, const float* kcur,
+                     const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream);
 
 }  // namespace strata::kernels

@@ -224,8 +224,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (!strata::gpu::alloc_host(&stage_in, CHUNK) ||
-        !strata::gpu::alloc_host(&stage_out, CHUNK * 2)) {
+    if (!strata::gpu::alloc_host(&stage_in, CHUNK, "weights-staging") ||
+        !strata::gpu::alloc_host(&stage_out, CHUNK * 2, "weights-staging")) {
         err = std::string("host allocation for the staging buffers failed: ") + strata::gpu::last_error();
         if (stage_in) strata::gpu::free(stage_in);
         if (stage_out) strata::gpu::free(stage_out);

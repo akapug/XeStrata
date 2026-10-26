@@ -81,8 +81,13 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, bool gate_later = false, bool g_ready = false,
-                         const void* x_q8_1 = nullptr);
-/// (`x_q8_1`: `x`'s q8_1 image as native_quantize_q8_1 writes it, made by the caller; gate and up read it.)
+                         const void* x_q8_1 = nullptr, bool x_q8_1_native = false);
+/// `x_q8_1`: caller-owned q8_1 input. `x_q8_1_native` explicitly attests native_quantize_q8_1 arithmetic, not just layout.
+/// False (the safe default): unknown or quantize_q8_1_rows' canonical expert image. The established MMVQ path still
+/// reads it as before, but the opt-in native-operand decode path must quantize its own 32-value blocks in existing scratch.
+/// STRATA_SHEXP_TILE: the most rows shared_expert_multi takes in one pass, 8 (the default) or 16; every row's bits are
+/// the same either way (mmvq_slm_parity).  The setter is for tests.
+void shared_expert_set_tile(int rows);
 /// Whether the shared expert's scalar gate is the native BF16 GEMV (shared_expert_set_native_bf16).
 bool shared_expert_native_bf16();
 
@@ -107,5 +112,12 @@ bool shared_expert_native_bf16();
 /// it, because the sum has to happen once over all k and not once per worker.
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
                  int64_t k, void* stream);
+
+/// STRATA_SHEXP_XMX in place of the environment (homelab K1 tests): shared_expert_multi's products on iq_mmq_decode from
+/// this many rows, 0 = never. This explicit parity override bypasses STRATA_DMMQ_MIN_ROWS so rows 1..16 are tested.
+/// A negative value restores the environment and its dispatch floor on the next call.
+void shared_expert_set_xmx(int min_rows);
+/// The effective threshold, for startup's capability probe before graph recording (no device work here).
+int shared_expert_xmx_min();
 
 }  // namespace strata::kernels

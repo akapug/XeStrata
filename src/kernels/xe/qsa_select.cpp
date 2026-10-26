@@ -14,7 +14,9 @@
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
 #include "strata/kernels/device_arch_tag.hpp"
+#include "param_table.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 
@@ -32,6 +34,22 @@ inline uint32_t order_key(float s) {
     if (!(v == v)) return 0u;
     const uint32_t b = sycl::bit_cast<uint32_t>(v);
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// STRATA_QSA_SCORES_STRIDE (default off, homelab): qsa_block_scores_slots on a grid of about kScoresStrideGroups
+// work-groups for the window instead of max_blocks / 8 a row.  Its grid follows the cache's capacity (131,072 cells:
+// 4,097 work-groups a row, 65,552 for a 16-row window) because a captured graph bakes it in, while a row reads only its
+// n_bid + 1 blocks (a few thousand at agent depths): ~9 in 10 work-groups return at once.  Here each sub-group walks
+// its row's blocks at a stride; every block's arithmetic is the default's, so the same scores.
+constexpr bool kScoresStrideDefault = false;
+constexpr size_t kScoresStrideGroups = 1024;
+int g_scores_stride_forced = -1;
+bool scores_stride_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_QSA_SCORES_STRIDE");
+        return v == nullptr ? kScoresStrideDefault : std::strtol(v, nullptr, 10) != 0;
+    }();
+    return g_scores_stride_forced >= 0 ? g_scores_stride_forced != 0 : env;
 }
 
 sycl::queue& queue_for(void* stream) {
@@ -276,6 +294,80 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             }
         });
     finish(stream, e, "qsa_block_scores");
+}
+
+void qsa_block_scores_set_stride(int on) { g_scores_stride_forced = on < 0 ? -1 : (on != 0); }
+
+void qsa_block_scores_slots(const QsaScoreSlots& tab, const float* q_idx, const int32_t* steps, int64_t nq,
+                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > kQsaSlotsMax)
+        throw core::DeviceError("qsa_block_scores_slots: unsupported indexer geometry or too many rows");
+    for (int64_t r = 0; r < nq; ++r)
+        if (!tab.pooled[r] || !tab.dead[r]) throw core::DeviceError("qsa_block_scores_slots: a row's keys are missing");
+    const QsaScoreSlots t_ = tab;
+    const size_t gx = size_t((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS);
+    if (scores_stride_on()) {
+        // STRATA_QSA_SCORES_STRIDE: `wg` work-groups a row, each sub-group walking the row's blocks [0, n_bid] at a
+        // stride of the row's sub-groups; the block's arithmetic is the body below, so the same bits
+        const size_t wg = std::min(gx, std::max<size_t>(8, kScoresStrideGroups / (size_t) nq));
+        const auto e = queue_for(stream).parallel_for(
+            sycl::nd_range<2>({size_t(nq), wg * SCORE_WARPS * WARP}, {1, SCORE_WARPS * WARP}),
+            xe::fits("qsa_block_scores_slots", [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int64_t qi = int64_t(it.get_group(0));
+                const int32_t* st = steps + qi * kStepCount;
+                const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+                const int lane = int(sg.get_local_linear_id());
+                const int64_t stride = int64_t(it.get_group_range(1)) * SCORE_WARPS;
+                const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+                for (int64_t b = int64_t(it.get_group(1)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
+                     b <= n_bid && b < max_blocks; b += stride) {   // uniform over the sub-group
+                    const float* key = (b == n_bid) ? t_.dead[qi] : t_.pooled[qi] + b * IDX_DIM;
+                    const float* kp = key + lane * 4;
+                    float score = 0.0f;
+                    for (int h = 0; h < IDX_HEADS; ++h) {
+                        const float* q4 = q + h * IDX_DIM;
+                        float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
+                        for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+                        score += d > 0.0f ? d : 0.0f;
+                    }
+                    if (lane == 0) {
+                        if (b == n_bid && n_kv % R != 0) score += 1e9f;
+                        scores[qi * max_blocks + b] = score;
+                    }
+                }
+            }));
+        finish(stream, e, "qsa_block_scores_slots");
+        return;
+    }
+    // qsa_block_scores' grid and body (nq rows, active_blocks unset), row qi's keys from its table entry
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, SCORE_WARPS * WARP}),
+        xe::fits("qsa_block_scores_slots stride", [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int64_t qi = int64_t(it.get_group(0));
+            const int32_t* st = steps + qi * kStepCount;
+            const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+            const int64_t b = int64_t(it.get_group(1)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
+            if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
+            const int lane = int(sg.get_local_linear_id());
+            const float* key = (b == n_bid) ? t_.dead[qi] : t_.pooled[qi] + b * IDX_DIM;
+            const float* kp = key + lane * 4;
+            const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+            float score = 0.0f;
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float* q4 = q + h * IDX_DIM;
+                float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
+                for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (lane == 0) {
+                if (b == n_bid && n_kv % R != 0) score += 1e9f;
+                scores[qi * max_blocks + b] = score;
+            }
+        }));
+    finish(stream, e, "qsa_block_scores_slots");
 }
 
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,

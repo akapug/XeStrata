@@ -20,7 +20,10 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <mutex>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -90,6 +93,103 @@ private:
     uint8_t block_[32] = {};
     size_t pending_ = 0;
     uint64_t total_ = 0;
+};
+
+// homelab kvib: the body checksum (Hash, unchanged: the same digest of the same bytes) on a thread of its own, so a
+// load or a save copies and hashes at once.  The reader or writer hands it each run of bytes in file order and goes on.
+// A run in the conversation's own memory, which stays put until the load or save ends (`stable`), is hashed where it
+// is; a small or passing one (a size, a codec, a reused compression buffer) is copied first.  With one copy thread
+// (STRATA_CONV_IO_THREADS=1) it hashes in the caller, as before.  digest() waits for every run.
+class HashPipe {
+public:
+    HashPipe() : threaded_(conversation_io_threads() > 1) {
+        if (threaded_) thread_ = std::thread([this] { loop(); });
+    }
+    HashPipe(const HashPipe&) = delete;
+    HashPipe& operator=(const HashPipe&) = delete;
+    ~HashPipe() { finish(); }
+    void add(const void* p, size_t n, bool stable) {
+        if (n == 0) return;
+        if (!threaded_) return hash_.update(p, n);
+        const auto* b = static_cast<const uint8_t*>(p);
+        if (!stable || n < kInline) {
+            small_.insert(small_.end(), b, b + n);
+            if (small_.size() >= kInline) flush();
+            return;
+        }
+        flush();
+        push({b, n, {}});
+    }
+    uint64_t digest() {
+        finish();
+        return hash_.digest();
+    }
+    // every run handed over is hashed, and nothing reads the caller's memory any more
+    void finish() {
+        if (!threaded_ || finished_) return;
+        flush();
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            end_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+        finished_ = true;
+    }
+
+private:
+    static constexpr size_t kInline = 64 * 1024;
+    struct Run {
+        const uint8_t* p;
+        size_t n;
+        std::vector<uint8_t> own;
+    };
+    void flush() {
+        if (small_.empty()) return;
+        Run r{nullptr, 0, std::move(small_)};
+        small_ = {};
+        push(std::move(r));
+    }
+    // a copied run waits while the copies already queued reach the bound (STRATA_CONV_HASH_QUEUE_MIB), so a hash that
+    // falls behind slows the reader or writer instead of piling up host memory; one run alone always goes
+    void push(Run r) {
+        {
+            std::unique_lock<std::mutex> lock(m_);
+            const size_t n = r.own.size();
+            room_.wait(lock, [&] { return own_ == 0 || own_ + n <= bound_; });
+            own_ += n;
+            q_.push_back(std::move(r));
+        }
+        cv_.notify_one();
+    }
+    void loop() {
+        conversation_io_widen_thread();
+        for (;;) {
+            Run r;
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [&] { return end_ || !q_.empty(); });
+                if (q_.empty()) return;
+                r = std::move(q_.front());
+                q_.pop_front();
+            }
+            if (r.own.empty()) hash_.update(r.p, r.n);
+            else hash_.update(r.own.data(), r.own.size());
+            if (!r.own.empty()) {
+                std::lock_guard<std::mutex> lock(m_);
+                own_ -= r.own.size();
+            }
+            room_.notify_one();
+        }
+    }
+    bool threaded_, finished_ = false, end_ = false;
+    Hash hash_;
+    std::vector<uint8_t> small_;
+    std::mutex m_;
+    std::condition_variable cv_, room_;
+    size_t own_ = 0, bound_ = conversation_io_hash_queue();
+    std::deque<Run> q_;
+    std::thread thread_;
 };
 
 #ifdef STRATA_HAVE_BLOSC2
@@ -260,18 +360,24 @@ std::array<const std::vector<uint8_t>*, 5> state_parts(const ConversationCheckpo
 // the indexer rows, FP16 K/V) go through c-blosc2's ZSTD at level 1 after a byte shuffle; 1-byte K/V codes gain
 // 4-7% and the small parts nothing, so they stay as they are (the 2026-10-04-conversation-save-compress record).
 struct Writer {
-    std::FILE* f = nullptr;
-    Hash hash;
+    FolderStream* f = nullptr;
+    HashPipe hash;
     bool ok = true;
     bool compress = false;
+    const std::atomic<bool>* cancel = nullptr;   // homelab: a claimed background park stops here
     std::vector<uint8_t> stage, packed;   // a chunk gathered from a buffer's segments, and its compressed form
 #ifdef STRATA_HAVE_BLOSC2
     Blosc2Context cctx[5];                // by element size
 #endif
-    void write(const void* p, size_t n) {
+    // `stable`: the bytes are the image's own (they stay put until the save ends)
+    void write(const void* p, size_t n, bool stable = false) {
         if (!ok || n == 0) return;
-        ok = std::fwrite(p, 1, n, f) == n;
-        hash.update(p, n);
+        if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
+            ok = false;
+            return;
+        }
+        ok = f->write(p, n);
+        hash.add(p, n, stable);
     }
     template<class T> void value(const T& v) { write(&v, sizeof v); }
     // typesize: the element size the shuffle groups bytes by (2 or 4), 0 for a part stored as it is
@@ -280,7 +386,7 @@ struct Writer {
         value((uint64_t) n);
         if (!compressing(n, typesize)) {
             value(kCodecNone);
-            write(p, n);
+            write(p, n, true);
             return;
         }
         value(kCodecBlosc2);
@@ -291,7 +397,7 @@ struct Writer {
         value((uint64_t) b.size());
         if (!compressing(b.size(), typesize)) {
             value(kCodecNone);
-            b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) { write(p, n); return ok; });
+            b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) { write(p, n, true); return ok; });
             return;
         }
         value(kCodecBlosc2);
@@ -338,25 +444,31 @@ constexpr size_t kPartHeader = sizeof(uint64_t) + sizeof(uint8_t);
 constexpr size_t kLayerHeader = sizeof(int32_t) + 6 * sizeof(int64_t);
 
 // a whole read, with the stream still good for the next one
-bool read_exact(std::FILE* f, void* p, size_t n) {
-    return std::fread(p, 1, n, f) == n && !std::ferror(f) && !std::feof(f);
+bool read_exact(FolderStream* f, void* p, size_t n) {
+    return f->read(p, n) == n && !f->failed();
 }
 
 // The checksum covers the stored bytes, so a compressed chunk is decompressed before the file's checksum is known:
 // its sizes are checked first, and c-blosc2 checks the rest of a chunk itself.
 struct FileReader {
-    std::FILE* f = nullptr;
-    Hash hash;
+    FolderStream* f = nullptr;
+    HashPipe hash;
     uint64_t left = 0;            // payload bytes the header promised and the body has not used yet
     const char* why = nullptr;    // a reason more useful than "damaged", when there is one
+    const std::atomic<bool>* cancel = nullptr;   // set: the read stops at the next piece
     std::vector<uint8_t> stage, packed;
 #ifdef STRATA_HAVE_BLOSC2
     Blosc2Context dctx;
 #endif
-    bool read(void* p, size_t n) {
+    // `stable`: `p` is the loaded image's own memory (it stays put until the load ends)
+    bool read(void* p, size_t n, bool stable = false) {
         if (n == 0) return true;
+        if (cancel != nullptr && cancel->load()) {
+            why = "cancelled";
+            return false;
+        }
         if (!read_exact(f, p, n)) return false;
-        hash.update(p, n);
+        hash.add(p, n, stable);
         return true;
     }
     template<class T> bool value(T& v) { return read(&v, sizeof v); }
@@ -375,7 +487,7 @@ struct FileReader {
         uint8_t codec = 0;
         if (!size(n, codec)) return false;
         v.resize((size_t) n);
-        if (codec == kCodecNone) return read(v.data(), v.size());
+        if (codec == kCodecNone) return read(v.data(), v.size(), true);
         for (size_t at = 0; at < v.size(); at += kChunk)
             if (!chunk(v.data() + at, std::min(kChunk, v.size() - at))) return false;
         return true;
@@ -384,8 +496,9 @@ struct FileReader {
         uint64_t n = 0;
         uint8_t codec = 0;
         if (!size(n, codec)) return false;
-        b.resize((size_t) n);
-        if (codec == kCodecNone) return b.visit(0, b.size(), [&](uint8_t* p, size_t k, size_t) { return read(p, k); });
+        b.resize_for_overwrite((size_t) n);   // every byte is read next (or the load fails and drops it)
+        if (codec == kCodecNone)
+            return b.visit(0, b.size(), [&](uint8_t* p, size_t k, size_t) { return read(p, k, true); });
         for (size_t at = 0; at < b.size(); at += kChunk) {
             const size_t len = std::min(kChunk, b.size() - at);
             uint8_t* dst = nullptr;
@@ -432,36 +545,19 @@ std::string hex(uint64_t v) {
     return s;
 }
 
-// fs::path's native string is UTF-16 on Windows, where fopen would take the ANSI code page
-std::FILE* open_read(const fs::path& path) {
-#if defined(_WIN32)
-    return ::_wfopen(path.c_str(), L"rb");
-#else
-    return std::fopen(path.c_str(), "rb");
-#endif
+bool ends_with(const std::string& s, const std::string& tail) {
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
 }
 
-struct Found {
-    fs::path path;
-    fs::file_time_type time;
-    uint64_t bytes = 0;
-};
-
-std::vector<Found> scan(const fs::path& dir) {
-    std::vector<Found> out;
-    std::error_code ec;
-    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        std::error_code e;
-        if (!it->is_regular_file(e) || it->path().extension() != kExtension) continue;
-        const auto time = it->last_write_time(e);
-        const auto bytes = e ? 0 : it->file_size(e);
-        if (!e) out.push_back({it->path(), time, bytes});
-    }
-    std::sort(out.begin(), out.end(), [](const Found& a, const Found& b) { return a.time < b.time; });
+// the folder's .xsc files, oldest first
+std::vector<FolderFile> scan(ConversationFolder& folder) {
+    std::vector<FolderFile> out = folder.list();
+    out.erase(std::remove_if(out.begin(), out.end(), [](const FolderFile& f) { return !ends_with(f.name, kExtension); }),
+              out.end());
     return out;
 }
 
-bool read_header(std::FILE* f, Header& h) {
+bool read_header(FolderStream* f, Header& h) {
     char magic[4];
     uint32_t version = 0;
     uint64_t length = 0, stored = 0;
@@ -523,29 +619,21 @@ std::string conversation_file_identity(const std::string& path) {
 
 bool ConversationDisk::open(ConversationDiskOptions options, std::string& error) {
     enabled_ = false;
-    entries_.clear();
+    {
+        std::lock_guard<std::mutex> lock(index_m_);
+        entries_.clear();
+    }
+    ConversationIoSettings io;
+    if (!conversation_io_settings_from_env(io, error)) return false;
+    conversation_io_set_threads(io.threads);
+    conversation_io_set_hash_queue(size_t(io.hash_queue_mib) << 20);
     options_ = std::move(options);
-    std::error_code ec;
-    if (!fs::exists(options_.dir, ec)) {
-        if (!fs::create_directories(options_.dir, ec) || ec) {
-            error = "cannot create " + options_.dir.string() + ": " + ec.message();
-            return false;
-        }
-        // the files hold what was computed from the conversations: the owner's only
-        fs::permissions(options_.dir, fs::perms::owner_all, fs::perm_options::replace, ec);
-    }
-    if (!fs::is_directory(options_.dir, ec)) {
-        error = options_.dir.string() + " is not a folder";
-        return false;
-    }
+    folder_ = options_.folder ? options_.folder : std::shared_ptr<ConversationFolder>(
+                                                      conversation_folder_open(options_.dir.string()));
+    if (!folder_->prepare(error)) return false;
     // a write cut short by a crash leaves its .tmp; nothing reads one
-    for (fs::directory_iterator it(options_.dir, ec), end; !ec && it != end; it.increment(ec)) {
-        const auto name = it->path().filename().string();
-        if (name.size() > 8 && name.compare(name.size() - 8, 8, ".xsc.tmp") == 0) {
-            std::error_code e;
-            fs::remove(it->path(), e);
-        }
-    }
+    for (const FolderFile& f : folder_->list())
+        if (f.name.size() > 8 && ends_with(f.name, ".xsc.tmp")) folder_->remove(f.name);
 #ifdef STRATA_HAVE_BLOSC2
     static const bool blosc2_ready = (blosc2_init(), true);   // once per process; the contexts do the rest
     (void) blosc2_ready;
@@ -556,30 +644,32 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
     }
     enabled_ = true;
     expire();
-    for (const Found& found : scan(options_.dir)) {
-        std::FILE* f = open_read(found.path);
-        if (f == nullptr) continue;
+    for (const FolderFile& found : scan(*folder_)) {
+        std::unique_ptr<FolderStream> f = folder_->open_read(found.name);
+        if (!f) continue;
         Header h;
-        const bool ok = read_header(f, h);
-        std::fclose(f);
+        const bool ok = read_header(f.get(), h);
+        f.reset();
         // another model, engine or setting (kept until it expires: its own engine may still use it), or damaged
         if (!ok || h.fingerprint != options_.fingerprint) continue;
         Entry e;
-        e.path = found.path;
+        e.name = found.name;
         for (const auto& c : h.checkpoints) e.checkpoints.push_back(prefix_of(h, c));
         e.live.ids = std::move(h.ids);
         e.live.imgs = std::move(h.imgs);
         e.cvec = h.cvec;
         e.payload = (size_t) h.payload;
+        std::lock_guard<std::mutex> lock(index_m_);
+        e.serial = next_serial_++;
         entries_.push_back(std::move(e));
     }
     return true;
 }
 
-bool ConversationDisk::remove_file(const fs::path& path) {
-    std::error_code ec;
-    const bool removed = fs::remove(path, ec);
-    entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.path == path; }),
+bool ConversationDisk::remove_file(const std::string& name) {
+    const bool removed = folder_->remove(name);
+    std::lock_guard<std::mutex> lock(index_m_);
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.name == name; }),
                    entries_.end());
     return removed;
 }
@@ -588,12 +678,12 @@ size_t ConversationDisk::expire() {
     if (!enabled_) return 0;
     const auto now = fs::file_time_type::clock::now();
     size_t removed = 0;
-    auto found = scan(options_.dir);
+    auto found = scan(*folder_);
     folder_bytes_ = 0;
-    std::vector<Found> kept;
-    for (const Found& f : found) {
+    std::vector<FolderFile> kept;
+    for (const FolderFile& f : found) {
         if (options_.max_age.count() > 0 && now - f.time > options_.max_age) {
-            removed += remove_file(f.path);
+            removed += remove_file(f.name);
             continue;
         }
         kept.push_back(f);
@@ -602,38 +692,51 @@ size_t ConversationDisk::expire() {
     // oldest first, every file in the folder (another model's too: the budget is the folder's)
     for (size_t i = 0; i < kept.size() && folder_bytes_ > options_.budget; ++i) {
         folder_bytes_ -= (size_t) kept[i].bytes;
-        removed += remove_file(kept[i].path);
+        removed += remove_file(kept[i].name);
     }
     return removed;
 }
 
 void ConversationDisk::touch(size_t index) {
-    Entry e = std::move(entries_.at(index));
-    entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
-    std::error_code ec;
-    fs::last_write_time(e.path, fs::file_time_type::clock::now(), ec);
-    entries_.push_back(std::move(e));
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(index_m_);
+        Entry e = std::move(entries_.at(index));
+        entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
+        name = e.name;
+        entries_.push_back(std::move(e));
+    }
+    folder_->touch(name);
 }
 
 bool ConversationDisk::load(size_t index, SavedConversation& image, std::string& error) {
-    const fs::path path = entries_.at(index).path;
+    const std::string path = entries_.at(index).name;
+    if (read_file(options_, *folder_, path, image, error)) return true;
+    error += " (deleted)";
+    remove_file(path);
+    return false;
+}
+
+bool ConversationDisk::read_file(const ConversationDiskOptions& options, ConversationFolder& folder,
+                                 const std::string& path, SavedConversation& image, std::string& error,
+                                 const std::atomic<bool>* cancel) {
     auto reject = [&](const char* why) {
-        error = path.filename().string() + ": " + why + " (deleted)";
-        remove_file(path);
+        error = path + ": " + why;
         return false;
     };
-    std::FILE* f = open_read(path);
-    if (f == nullptr) return reject("cannot open");
-    struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close{f};
+    const std::unique_ptr<FolderStream> file = folder.open_read(path);
+    if (!file) return reject("cannot open");
+    FolderStream* f = file.get();
     Header h;
-    if (!read_header(f, h) || h.fingerprint != options_.fingerprint) return reject("unreadable header");
+    if (!read_header(f, h) || h.fingerprint != options.fingerprint) return reject("unreadable header");
 #ifdef STRATA_HAVE_BLOSC2
     const WideAffinity wide;
 #endif
+    SavedConversation out;   // before the reader: its checksum thread reads `out` until the reader ends
     FileReader r;
     r.f = f;
+    r.cancel = cancel;
     r.left = h.payload;
-    SavedConversation out;
     out.geometry = h.geometry;
     out.cvec = h.cvec;
     out.live.ids = h.ids;
@@ -644,7 +747,7 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
     };
     auto state = [&](ConversationCheckpoint& c) {   // its own, then the later GPUs' of a layer split
         bool good = one(c);
-        c.stage_parts.resize(options_.stage_parts);
+        c.stage_parts.resize(options.stage_parts);
         for (auto& part : c.stage_parts) {
             part.ids = c.ids;
             part.imgs = c.imgs;
@@ -665,7 +768,7 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
     }
     if (!ok) return reject(r.why != nullptr ? r.why : "short or damaged body");
     char extra;
-    if (r.left != 0 || std::fread(&extra, 1, 1, f) != 0) return reject("unexpected length");
+    if (r.left != 0 || f->read(&extra, 1) != 0) return reject("unexpected length");
     if (r.hash.digest() != h.body_hash) return reject("checksum differs");
     image = std::move(out);
     return true;
@@ -674,9 +777,19 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
 bool ConversationDisk::save(const SavedConversation& image, size_t& written, std::string& error) {
     written = 0;
     if (!enabled_) return true;
-    const auto kept = kept_checkpoints(image.checkpoints, options_.checkpoints);
+    Written file;
+    if (!write_file(options_, *folder_, image, file, error)) return false;
+    written = file.bytes;
+    adopt(file);
+    return true;
+}
+
+bool ConversationDisk::write_file(const ConversationDiskOptions& options, ConversationFolder& folder,
+                                  const SavedConversation& image, Written& out, std::string& error,
+                                  const std::atomic<bool>* cancel) {
+    const auto kept = kept_checkpoints(image.checkpoints, options.checkpoints);
     Header h;
-    h.fingerprint = options_.fingerprint;
+    h.fingerprint = options.fingerprint;
     h.cvec = image.cvec;
     h.geometry = image.geometry;
     h.ids = image.live.ids;
@@ -689,12 +802,12 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         return true;
     };
     auto count_state = [&](const ConversationCheckpoint& c) {
-        if (c.stage_parts.size() != options_.stage_parts) return false;
+        if (c.stage_parts.size() != options.stage_parts) return false;
         bool good = count_one(c);
         for (const auto& part : c.stage_parts) good = good && count_one(part);
         return good;
     };
-    if (image.live.stage_parts.size() != options_.stage_parts) {
+    if (image.live.stage_parts.size() != options.stage_parts) {
         error = "the conversation's layer-split parts differ from the folder's";
         return false;
     }
@@ -723,50 +836,41 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         error = "conversation size overflow";
         return false;
     }
-    if (total > options_.budget) {
+    if (total > options.budget) {
         error = "the conversation (" + std::to_string(total >> 20) + " MiB) exceeds the folder's budget";
         return false;
     }
     Hash name;
-    name.update(options_.fingerprint.data(), options_.fingerprint.size());
+    name.update(options.fingerprint.data(), options.fingerprint.size());
     name.update(h.ids.data(), h.ids.size() * sizeof(int32_t));
     for (const auto& k : h.imgs) { name.update(&k.start, 8); name.update(&k.hash, 8); }
     const uint8_t cvec = h.cvec;
     name.update(&cvec, 1);
-    const fs::path path = options_.dir / (hex(name.digest()) + kExtension);
-    const fs::path tmp = path.string() + ".tmp";
-#if defined(_WIN32)
-    const int fd = ::_wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY | _O_NOINHERIT,
-                            _S_IREAD | _S_IWRITE);
-    std::FILE* f = fd < 0 ? nullptr : ::_fdopen(fd, "wb");
-    if (f == nullptr) {
-        if (fd >= 0) ::_close(fd);
-#else
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
-    if (f == nullptr) {
-        if (fd >= 0) ::close(fd);
-#endif
-        error = "cannot create " + tmp.string();
+    const std::string path = hex(name.digest()) + kExtension;
+    const std::string tmp = path + ".tmp";
+    std::unique_ptr<FolderStream> file = folder.open_write(tmp);
+    if (!file) {
+        error = "cannot create " + tmp + " in " + folder.where();
         return false;
     }
+    FolderStream* f = file.get();
     const uint64_t length = header.size();
     auto prefix = [&]() {
         Hash hh;
         hh.update(header.data(), header.size());
         const uint64_t header_hash = hh.digest();
-        return std::fwrite(kMagic, 1, 4, f) == 4 && std::fwrite(&kVersion, 4, 1, f) == 1 &&
-               std::fwrite(&length, 8, 1, f) == 1 && std::fwrite(header.data(), 1, header.size(), f) == header.size() &&
-               std::fwrite(&header_hash, 8, 1, f) == 1;
+        return f->write(kMagic, 4) && f->write(&kVersion, 4) && f->write(&length, 8) &&
+               f->write(header.data(), header.size()) && f->write(&header_hash, 8);
     };
     // the body's checksum is in the header: write the header, the body, then the header again with it
 #ifdef STRATA_HAVE_BLOSC2
     std::optional<WideAffinity> wide;
-    if (options_.compress) wide.emplace();
+    if (options.compress) wide.emplace();
 #endif
     Writer w;
     w.f = f;
-    w.compress = options_.compress;
+    w.compress = options.compress;
+    w.cancel = cancel;
     w.ok = prefix();
     auto write_one = [&](const ConversationCheckpoint& c) {
         w.part(c.gdn.data(), c.gdn.size(), sizeof(float));   // the DeltaNet states; the rest is about 1 MiB
@@ -788,58 +892,79 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         w.part(kv.k, kv_type); w.part(kv.v, kv_type); w.part(kv.k_scale); w.part(kv.v_scale);
         w.part(kv.pooled, sizeof(float));
     }
-#if defined(_WIN32)
-    const long long end = ::_ftelli64(f);   // the file's length: the body ends it (ftell's long is 32 bits here)
-#else
-    const long end = std::ftell(f);   // the file's length: the body ends it
-#endif
+    const int64_t end = f->tell();   // the file's length: the body ends it
     bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
         header = encode(h);
-        ok = header.size() == length && std::fseek(f, 0, SEEK_SET) == 0 && prefix();
+        ok = header.size() == length && f->seek(0) && prefix();
     }
-    ok = std::fflush(f) == 0 && ok;
-#if defined(_WIN32)
-    ok = ::_commit(::_fileno(f)) == 0 && ok;
-#else
-    ok = ::fsync(::fileno(f)) == 0 && ok;
-#endif
-    ok = std::fclose(f) == 0 && ok;
-    std::error_code ec;
-    if (ok) fs::rename(tmp, path, ec);
-    if (!ok || ec) {
-        fs::remove(tmp, ec);
-        error = "cannot write " + path.string();
+    ok = file->finish() && ok;
+    file.reset();
+    if (!ok || !folder.rename(tmp, path)) {
+        folder.remove(tmp);
+        error = cancel != nullptr && cancel->load() ? "cancelled" : "cannot write " + path + " in " + folder.where();
         return false;
     }
-    written = (size_t) end;
+    out = {};
+    out.name = path;
+    out.bytes = (size_t) end;
+    out.payload = payload;
+    out.live.ids = h.ids;
+    out.live.imgs = h.imgs;
+    for (const auto& c : h.checkpoints) out.checkpoints.push_back(prefix_of(h, c));
+    for (const auto& c : image.checkpoints) {
+        ConversationCheckpoint k;
+        k.ids = c.ids;
+        k.imgs = c.imgs;
+        out.chain.push_back(std::move(k));
+    }
+    out.cvec = h.cvec;
+    return true;
+}
+
+void ConversationDisk::adopt(const Written& file) {
+    if (!enabled_) return;
+    folder_->list();   // a store learns where another connection put the file
+    const std::string& path = file.name;
     // #342 as the RAM cache applies it: a file whose deepest checkpoint this conversation's chain holds is the same
     // chat a turn (or a restart) back
-    for (size_t i = 0; i < entries_.size();) {
-        const Entry& e = entries_[i];
+    std::vector<std::string> superseded;
+    for (const Entry& e : entries_) {
         const ConversationCheckpoint* deepest = nullptr;
         for (const auto& c : e.checkpoints)
             if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-        if (e.path != path && e.cvec == image.cvec && deepest &&
-            conversation_chain_holds(*deepest, image.live.ids, image.live.imgs, image.checkpoints)) {
-            remove_file(e.path);
-            continue;
-        }
-        ++i;
+        if (e.name != path && e.cvec == file.cvec && deepest &&
+            conversation_chain_holds(*deepest, file.live.ids, file.live.imgs, file.chain))
+            superseded.push_back(e.name);
     }
-    entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.path == path; }),
-                   entries_.end());
+    for (const auto& name : superseded) remove_file(name);
     Entry e;
-    e.path = path;
-    e.live.ids = h.ids;
-    e.live.imgs = h.imgs;
-    for (const auto& c : h.checkpoints) e.checkpoints.push_back(prefix_of(h, c));
-    e.cvec = h.cvec;
-    e.payload = payload;
-    entries_.push_back(std::move(e));
+    e.name = path;
+    e.live = file.live;
+    e.checkpoints = file.checkpoints;
+    e.cvec = file.cvec;
+    e.payload = file.payload;
+    {
+        std::lock_guard<std::mutex> lock(index_m_);
+        e.serial = next_serial_++;
+        entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& x) { return x.name == path; }),
+                       entries_.end());
+        entries_.push_back(std::move(e));
+    }
     expire();
-    return true;
+}
+
+std::shared_ptr<ConversationFolder> ConversationDisk::open_writer_folder(std::string& error) const {
+    std::shared_ptr<ConversationFolder> f = options_.folder_factory
+        ? options_.folder_factory()
+        : std::shared_ptr<ConversationFolder>(conversation_folder_open(options_.dir.string()));
+    if (!f) {
+        error = "no second connection to " + folder_->where();
+        return nullptr;
+    }
+    if (!f->prepare(error)) return nullptr;
+    return f;
 }
 
 } // namespace strata::core

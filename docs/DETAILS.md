@@ -705,6 +705,8 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
   The engine continues from what it already holds, so nothing is read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.
+  Set `STRATA_REASONING_WRAP_UP` in the server's environment at startup to replace the closing sentence.
+  An unset or empty value keeps the default sentence; the surrounding newlines and `</think>` are unchanged.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
   Off by default; Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and is also the budget (a `reasoning_budget_tokens` in the same request wins).
 - **max_tokens counts the thinking, so the answer keeps its room.** A client that caps the whole reply (the desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about used to be cut off in the middle of the thinking, with no answer.
